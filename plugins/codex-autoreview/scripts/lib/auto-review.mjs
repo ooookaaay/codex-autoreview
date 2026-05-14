@@ -41,9 +41,9 @@ import { DEFAULT_BACKEND_ID, isKnownBackend } from "./reviewers/index.mjs";
 import {
   generateReviewId,
   healStuckReviews,
-  listReviews,
   resolveReviewLogFile,
   updateReviewIf,
+  updateState,
   upsertReview
 } from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -51,6 +51,11 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 const LIB_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_DIR = path.resolve(LIB_DIR, "..");
 const WORKER_SCRIPT = path.join(SCRIPTS_DIR, "review-worker.mjs");
+
+/** ISO timestamp — matches the `createdAt`/`updatedAt` stamping `upsertReview` uses. */
+function nowIso() {
+  return new Date().toISOString();
+}
 
 /** Claude session id env var the worker reads to scope reviews to a session. */
 export const SESSION_ID_ENV = "CODEX_AUTOREVIEW_SESSION_ID";
@@ -238,17 +243,6 @@ export function dispatchBackgroundReview(params) {
   // already pending, or completed recently. Only meaningful when we have an
   // anchoring hash to key on; a non-git / no-text review always dispatches.
   const dedupeKey = dedupeKeyOf({ kind, reviewedInputHash, backend });
-  if (dedupeKey) {
-    const existing = findDuplicateReview(listReviews(workspaceRoot), dedupeKey);
-    if (existing) {
-      return {
-        dispatched: false,
-        reviewId: existing.id,
-        deduped: true,
-        detail: `An equivalent ${kind} review (${existing.id}, ${existing.status}) already covers this exact input.`
-      };
-    }
-  }
 
   const reviewId = generateReviewId(kind === "plan" ? "plan" : "code");
   const logFile = resolveReviewLogFile(workspaceRoot, reviewId);
@@ -273,35 +267,68 @@ export function dispatchBackgroundReview(params) {
   const trigger =
     typeof params.trigger === "string" && params.trigger ? params.trigger : null;
 
-  // Persist the queued record before spawning so the worker has everything it
-  // needs and the review is visible immediately. NOTE: no fully-rendered
-  // `prompt` is stored — only metadata and the redactable runtime payload.
-  upsertReview(workspaceRoot, {
-    id: reviewId,
-    kind,
-    status: "queued",
-    verdict: null,
-    output: null,
-    errorMessage: null,
-    logFile,
-    backend,
-    request: {
-      cwd,
-      model,
-      effort,
-      timeoutMs,
-      backend,
-      profile,
-      ...(backendConfig ? { backendConfig } : {}),
-      ...(reviewedInputHash ? { reviewedInputHash } : {}),
-      ...(projectInstructionsPath ? { projectInstructionsPath } : {}),
-      ...(trigger ? { trigger } : {}),
-      ...(sessionId ? { sessionId } : {}),
-      // Redactable runtime payload — the worker strips these once it has them.
-      ...(planText ? { planText } : {}),
-      ...(claudeResponseBlock ? { claudeResponseBlock } : {})
+  // F-04 — RACE-FREE check-and-insert. The duplicate scan AND the queued-record
+  // insert happen inside ONE locked `updateState` critical section, so two hooks
+  // firing for the same input cannot both observe "no duplicate" and both
+  // insert: whichever wins the lock inserts; the other sees that record and
+  // dedupes against it. (A bare read-then-insert — `findDuplicateReview` over a
+  // separate `listReviews`, then a later `upsertReview` — left exactly that TOCTOU
+  // window open.) The worker spawn stays AFTER the critical section, gated on
+  // whether THIS call actually inserted a fresh record.
+  const timestamp = nowIso();
+  /** @type {import("./state.mjs").ReviewRecord | null} */
+  let duplicate = null;
+  updateState(workspaceRoot, (state) => {
+    if (dedupeKey) {
+      duplicate = findDuplicateReview(state.reviews, dedupeKey);
+      if (duplicate) {
+        // An equivalent review already covers this input — do NOT insert.
+        return;
+      }
     }
+    // No equivalent review (or no anchoring hash to key on): insert exactly one
+    // new queued record. NOTE: no fully-rendered `prompt` is stored — only
+    // metadata and the redactable runtime payload.
+    state.reviews.unshift({
+      id: reviewId,
+      kind,
+      status: "queued",
+      verdict: null,
+      output: null,
+      errorMessage: null,
+      logFile,
+      backend,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      request: {
+        cwd,
+        model,
+        effort,
+        timeoutMs,
+        backend,
+        profile,
+        ...(backendConfig ? { backendConfig } : {}),
+        ...(reviewedInputHash ? { reviewedInputHash } : {}),
+        ...(projectInstructionsPath ? { projectInstructionsPath } : {}),
+        ...(trigger ? { trigger } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        // Redactable runtime payload — the worker strips these once it has them.
+        ...(planText ? { planText } : {}),
+        ...(claudeResponseBlock ? { claudeResponseBlock } : {})
+      }
+    });
   });
+
+  if (duplicate) {
+    // Deduped INSIDE the lock — no fresh record was inserted, so no worker is
+    // spawned. Same external contract as before: return the EXISTING review's id.
+    return {
+      dispatched: false,
+      reviewId: duplicate.id,
+      deduped: true,
+      detail: `An equivalent ${kind} review (${duplicate.id}, ${duplicate.status}) already covers this exact input.`
+    };
+  }
 
   const childEnv = {
     ...process.env,
