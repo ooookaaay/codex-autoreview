@@ -17,11 +17,13 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import {
+  resolveEffectiveReviewModel,
   resolveReviewEffort,
-  resolveReviewModel,
   resolveReviewTimeoutMs,
   spawnDetached
 } from "./codex.mjs";
+import { computeDiffFingerprint, computePlanHash } from "./git.mjs";
+import { DEFAULT_BACKEND_ID, isKnownBackend } from "./reviewers/index.mjs";
 import {
   generateReviewId,
   healStuckReviews,
@@ -49,8 +51,11 @@ export const SESSION_ID_ENV = "CODEX_AUTOREVIEW_SESSION_ID";
  * @param {string} params.cwd - Working directory for the Codex run.
  * @param {"plan" | "code"} params.kind - Which review this is.
  * @param {string} params.prompt - The review prompt to hand to Codex.
- * @param {{ model?: unknown, effort?: unknown, timeoutMs?: unknown }} params.config
+ * @param {{ model?: unknown, effort?: unknown, timeoutMs?: unknown, backend?: unknown, backendConfig?: unknown }} params.config
  * @param {string | null} [params.sessionId] - Claude session id, if known.
+ * @param {string} [params.profile] - Review profile id (F2). Defaults per kind.
+ * @param {string} [params.planText] - The plan text, for `kind === "plan"` —
+ *   used to compute the F4 `planHash` anchor.
  * @param {(command: string, args: string[], options: object) => { pid: number | null }} [params.spawn]
  *   - Injectable detached-spawn function (defaults to `spawnDetached`), for tests.
  * @returns {{ dispatched: boolean, reviewId: string | null, detail: string | null }}
@@ -72,11 +77,42 @@ export function dispatchBackgroundReview(params) {
     // Self-heal is best-effort — never let it block a dispatch.
   }
 
-  const model = resolveReviewModel(config);
+  // F1: resolve the reviewer backend from config; an unknown id falls back to
+  // the non-breaking default (today's `exec-generic` behavior).
+  const backend = isKnownBackend(config.backend) ? config.backend : DEFAULT_BACKEND_ID;
+  const backendConfig =
+    config.backendConfig && typeof config.backendConfig === "object"
+      ? config.backendConfig
+      : null;
+  // F5/C: resolve the EFFECTIVE model — the plugin override, else the user's
+  // own `~/.codex/config.toml` default (re-supplied explicitly because the
+  // hardened `codex exec` invocation passes `--ignore-user-config`).
+  const model = resolveEffectiveReviewModel(config);
   const effort = resolveReviewEffort(config);
   const timeoutMs = resolveReviewTimeoutMs(config);
+  const profile =
+    typeof params.profile === "string" && params.profile
+      ? params.profile
+      : kind === "plan"
+        ? "plan-devils-advocate"
+        : "generic-code";
   const reviewId = generateReviewId(kind === "plan" ? "plan" : "code");
   const logFile = resolveReviewLogFile(workspaceRoot, reviewId);
+
+  // F4: capture the anchoring fingerprint at dispatch time so the worker can
+  // detect a working tree / plan that moved under the review. Best-effort —
+  // a non-git tree just has no code fingerprint.
+  let reviewedInputHash = null;
+  try {
+    if (kind === "plan") {
+      reviewedInputHash = computePlanHash(params.planText ?? prompt);
+    } else {
+      const fingerprint = computeDiffFingerprint(cwd);
+      reviewedInputHash = fingerprint.available ? fingerprint.fingerprint : null;
+    }
+  } catch {
+    reviewedInputHash = null;
+  }
 
   // Persist the queued record and the prompt-bearing request before spawning so
   // the worker has everything it needs and the review is visible immediately.
@@ -88,12 +124,17 @@ export function dispatchBackgroundReview(params) {
     output: null,
     errorMessage: null,
     logFile,
+    backend,
     request: {
       cwd,
       prompt,
       model,
       effort,
       timeoutMs,
+      backend,
+      profile,
+      ...(backendConfig ? { backendConfig } : {}),
+      ...(reviewedInputHash ? { reviewedInputHash } : {}),
       ...(sessionId ? { sessionId } : {})
     }
   });

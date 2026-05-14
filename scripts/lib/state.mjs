@@ -17,7 +17,20 @@ import path from "node:path";
 
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
-const STATE_VERSION = 1;
+/**
+ * On-disk state schema version.
+ *
+ * v1 → v2 (F3, Phase 1 FOUNDATION): added the accept/reject memory
+ * (`config.dismissedFindings`), the reviewer-backend config keys
+ * (`config.backend`, `config.backendConfig`, `config.pricing`), the
+ * onboarding marker (`config.onboardedAt`), the accumulated review-gap
+ * accumulator (`reviewGaps`), and the per-review anchoring / structured-result
+ * fields (`request.reviewedInputHash`, `request.backend`, `review.result`,
+ * `review.reviewedInputHash`). All additive — {@link loadState} reads a v1
+ * file unchanged (missing keys fill from {@link defaultState}), so the bump is
+ * backward-compatible.
+ */
+const STATE_VERSION = 2;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-autoreview");
 const STATE_FILE_NAME = "state.json";
@@ -43,12 +56,51 @@ const LOCK_ACQUIRE_TIMEOUT_MS = 30_000;
 const LOCK_RETRY_MS = 25;
 
 /**
+ * @typedef {object} DismissedFinding
+ * Accept/reject memory entry (F3): a finding the user explicitly dismissed, so
+ * later reviews stop re-surfacing it. Phase 2C's accept/reject loop reads/writes
+ * this list.
+ * @property {string} fingerprint - Stable finding fingerprint (file + line
+ *   window + normalized title) — the dedupe key.
+ * @property {"accepted" | "rejected"} disposition - `accepted` = the user
+ *   acknowledged and will not act; `rejected` = the user judged it a false
+ *   positive. Both suppress re-surfacing; the distinction feeds calibration.
+ * @property {string} dismissedAt - ISO timestamp.
+ * @property {string | null} [note] - Optional user note on why.
+ */
+
+/**
+ * @typedef {object} ReviewGap
+ * An accumulated "review gap" (F3): a claim a review could NOT verify, plus the
+ * concrete oracle that would verify it next time. Flattened from each review's
+ * `result.unverified[]`. Phase 2C's review-gap feedback loop reads this.
+ * @property {string} gap - What could not be verified.
+ * @property {string} suggestedOracle - The test/fixture/script that would.
+ * @property {boolean} critical - Whether it was surfaced as critical.
+ * @property {string} reviewId - The review that recorded the gap.
+ * @property {"plan" | "code"} kind
+ * @property {string} recordedAt - ISO timestamp.
+ */
+
+/**
  * @typedef {object} AutoReviewConfig
  * @property {boolean} enabled - Whether the automatic reviews are turned on.
  * @property {string | null} model - Codex model override, or null for default.
  * @property {string | null} effort - Codex reasoning effort override, or null.
  * @property {number | null} timeoutMs - Hard per-review `codex exec` timeout in
  *   milliseconds, or null to use the built-in default.
+ * @property {string} backend - Reviewer backend id (F1). Defaults to
+ *   `"exec-generic"` — today's behavior, the non-breaking migration default.
+ * @property {object | null} backendConfig - Backend-specific config (e.g. the
+ *   `externalCommand` object for the `external` backend), or null.
+ * @property {Record<string, { in: number, cachedIn?: number, out: number }>} pricing
+ *   Per-model USD-per-1M-token rate overrides (F6) — wins over the hardcoded
+ *   table. Empty object by default.
+ * @property {DismissedFinding[]} dismissedFindings - Accept/reject memory (F3).
+ * @property {string | null} onboardedAt - ISO timestamp the user completed the
+ *   guided onboarding flow, or null when not yet onboarded. A Phase 2
+ *   `SessionStart` hook consumes this; review hooks no-op until it is set.
+ *   ABSENT/null = not yet onboarded.
  */
 
 /**
@@ -119,8 +171,9 @@ export function isTerminalStatus(review) {
  * @property {string} id - Unique review/job id.
  * @property {"plan" | "code"} kind - Which hook produced the review.
  * @property {"queued" | "running" | "completed" | "failed"} status
- * @property {string | null} verdict - The first contract line (e.g. "SOUND: ...").
- * @property {string | null} output - The full Codex final message.
+ * @property {string | null} verdict - The compact `<VERDICT>: <summary>` line.
+ * @property {string | null} output - The compact human-facing review text,
+ *   rendered FROM {@link ReviewRecord.result} (F2).
  * @property {string | null} errorMessage
  * @property {string} createdAt - ISO timestamp.
  * @property {string} updatedAt - ISO timestamp.
@@ -128,8 +181,20 @@ export function isTerminalStatus(review) {
  * @property {number | null} [pid] - Detached worker pid, when known.
  * @property {string | null} [surfacedAt] - ISO timestamp when the completed
  *   verdict was injected into a Claude session, or absent/null if not yet.
+ * @property {import("./review-schema.mjs").ReviewResult | null} [result] - The
+ *   full F2 claim-based structured review object, when the backend produced
+ *   one. The text fields above are rendered from this. (F2/F3)
+ * @property {string | null} [reviewedInputHash] - The anchoring fingerprint
+ *   (diff fingerprint / planHash) the review was actually computed against, as
+ *   recomputed at settle time — compared to `request.reviewedInputHash` for
+ *   stale detection. (F3/F4)
+ * @property {string} [backend] - The reviewer backend id that produced this
+ *   review (F1).
+ * @property {boolean} [degraded] - `true` when the backend could not populate
+ *   the full structured result (a prose-only backend). (F1/F2)
  * @property {object} [request] - The queued request payload (carries the
- *   prompt, model, effort, timeout, and the Claude `sessionId` when known).
+ *   prompt, model, effort, timeout, `backend`, `backendConfig`,
+ *   `reviewedInputHash`, and the Claude `sessionId` when known).
  */
 
 function nowIso() {
@@ -137,7 +202,15 @@ function nowIso() {
 }
 
 /**
- * @returns {{ version: number, config: AutoReviewConfig, reviews: ReviewRecord[] }}
+ * @typedef {object} AutoReviewState
+ * @property {number} version - On-disk schema version.
+ * @property {AutoReviewConfig} config
+ * @property {ReviewRecord[]} reviews - Ring buffer of recent reviews.
+ * @property {ReviewGap[]} reviewGaps - Accumulated unverified-claim gaps (F3).
+ */
+
+/**
+ * @returns {AutoReviewState}
  */
 function defaultState() {
   return {
@@ -146,9 +219,20 @@ function defaultState() {
       enabled: false,
       model: null,
       effort: null,
-      timeoutMs: null
+      timeoutMs: null,
+      // F1: reviewer backend. Default reproduces today's behavior exactly.
+      backend: "exec-generic",
+      backendConfig: null,
+      // F6: per-model price overrides (wins over the hardcoded table).
+      pricing: {},
+      // F3: accept/reject memory — findings the user dismissed.
+      dismissedFindings: [],
+      // F3: onboarding marker — null/absent means "not yet onboarded".
+      onboardedAt: null
     },
-    reviews: []
+    reviews: [],
+    // F3: accumulated review gaps (flattened unverified[] across reviews).
+    reviewGaps: []
   };
 }
 
@@ -335,28 +419,60 @@ export function resolveReviewLogFile(cwd, reviewId) {
  * Load the persisted state for `cwd`, falling back to defaults when missing or
  * corrupt.
  *
+ * BACKWARD-COMPATIBLE (F3): an older v1 state file has no `backend`/`pricing`/
+ * `dismissedFindings`/`onboardedAt`/`reviewGaps` — every missing key is filled
+ * from {@link defaultState}, so a v1 file loads cleanly as v2 with the
+ * onboarding marker absent (= not yet onboarded) and today's-behavior defaults.
+ *
  * @param {string} cwd
- * @returns {{ version: number, config: AutoReviewConfig, reviews: ReviewRecord[] }}
+ * @returns {AutoReviewState}
  */
 export function loadState(cwd) {
   const stateFile = resolveStateFile(cwd);
+  const base = defaultState();
   if (!fs.existsSync(stateFile)) {
-    return defaultState();
+    return base;
   }
 
   try {
     const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const parsedConfig =
+      parsed.config && typeof parsed.config === "object" ? parsed.config : {};
     return {
-      ...defaultState(),
+      ...base,
       ...parsed,
+      // Always re-stamp the version: a loaded v1 file is now a v2 in memory.
+      version: STATE_VERSION,
       config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
+        ...base.config,
+        ...parsedConfig,
+        // Defensively re-default the structured config keys: a v1 file omits
+        // them, and a corrupt value must not poison a typed array/object.
+        backend:
+          typeof parsedConfig.backend === "string" && parsedConfig.backend
+            ? parsedConfig.backend
+            : base.config.backend,
+        backendConfig:
+          parsedConfig.backendConfig && typeof parsedConfig.backendConfig === "object"
+            ? parsedConfig.backendConfig
+            : null,
+        pricing:
+          parsedConfig.pricing && typeof parsedConfig.pricing === "object"
+            ? parsedConfig.pricing
+            : {},
+        dismissedFindings: Array.isArray(parsedConfig.dismissedFindings)
+          ? parsedConfig.dismissedFindings
+          : [],
+        onboardedAt:
+          typeof parsedConfig.onboardedAt === "string" && parsedConfig.onboardedAt
+            ? parsedConfig.onboardedAt
+            : null
       },
-      reviews: Array.isArray(parsed.reviews) ? parsed.reviews : []
+      reviews: Array.isArray(parsed.reviews) ? parsed.reviews : [],
+      reviewGaps: Array.isArray(parsed.reviewGaps) ? parsed.reviewGaps : []
     };
   } catch {
-    return defaultState();
+    return base;
   }
 }
 
@@ -400,26 +516,33 @@ function pruneReviews(reviews) {
   );
 }
 
+/** Hard cap on the accumulated review-gap buffer (F3) — newest kept. */
+const MAX_REVIEW_GAPS = 50;
+
 /**
- * Persist `state` for `cwd`. Prunes the review buffer to `MAX_REVIEWS`.
+ * Persist `state` for `cwd`. Prunes the review buffer to `MAX_REVIEWS` and the
+ * review-gap accumulator to {@link MAX_REVIEW_GAPS}.
  *
  * The write is atomic: the JSON is written to a unique temp file and then
  * `rename`d over the real state file, so a concurrent reader never observes a
  * truncated or partially written file.
  *
  * @param {string} cwd
- * @param {{ config?: Partial<AutoReviewConfig>, reviews?: ReviewRecord[] }} state
- * @returns {{ version: number, config: AutoReviewConfig, reviews: ReviewRecord[] }}
+ * @param {{ config?: Partial<AutoReviewConfig>, reviews?: ReviewRecord[], reviewGaps?: ReviewGap[] }} state
+ * @returns {AutoReviewState}
  */
 export function saveState(cwd, state) {
   ensureStateDir(cwd);
+  const reviewGaps = Array.isArray(state.reviewGaps) ? state.reviewGaps : [];
   const nextState = {
     version: STATE_VERSION,
     config: {
       ...defaultState().config,
       ...(state.config ?? {})
     },
-    reviews: pruneReviews(state.reviews ?? [])
+    reviews: pruneReviews(state.reviews ?? []),
+    // Keep only the newest gaps so the accumulator can't grow without bound.
+    reviewGaps: reviewGaps.slice(-MAX_REVIEW_GAPS)
   };
   const stateFile = resolveStateFile(cwd);
   const tempFile = `${stateFile}.${process.pid}.${Date.now().toString(36)}.tmp`;
@@ -443,8 +566,8 @@ export function saveState(cwd, state) {
  * concurrent hooks and the detached worker cannot lose each other's updates.
  *
  * @param {string} cwd
- * @param {(state: { version: number, config: AutoReviewConfig, reviews: ReviewRecord[] }) => void} mutate
- * @returns {{ version: number, config: AutoReviewConfig, reviews: ReviewRecord[] }}
+ * @param {(state: AutoReviewState) => void} mutate
+ * @returns {AutoReviewState}
  */
 export function updateState(cwd, mutate) {
   return withStateLock(cwd, () => {
@@ -858,4 +981,194 @@ export function healStuckReviews(cwd, options = {}) {
     }
   });
   return { healed };
+}
+
+// --------------------------------------------------------------------------
+// F3 — state-schema-extension accessors. All backward-compatible: they read a
+// v1 state file (where these fields are absent) as the documented defaults.
+// --------------------------------------------------------------------------
+
+/**
+ * Whether the user has completed the guided onboarding flow for this workspace.
+ * ABSENT/null marker = not yet onboarded. A Phase 2 `SessionStart` hook uses
+ * this to trigger onboarding; review hooks no-op until it returns `true`.
+ *
+ * @param {string} cwd
+ * @returns {boolean}
+ */
+export function isOnboarded(cwd) {
+  const onboardedAt = loadState(cwd).config.onboardedAt;
+  return typeof onboardedAt === "string" && onboardedAt.trim().length > 0;
+}
+
+/**
+ * Read the raw onboarding timestamp (ISO string), or `null` when not yet
+ * onboarded.
+ *
+ * @param {string} cwd
+ * @returns {string | null}
+ */
+export function getOnboardedAt(cwd) {
+  const onboardedAt = loadState(cwd).config.onboardedAt;
+  return typeof onboardedAt === "string" && onboardedAt.trim() ? onboardedAt : null;
+}
+
+/**
+ * Mark the workspace as onboarded (idempotent — does not overwrite an existing
+ * timestamp). Phase 1 only provides the accessor; the Phase 2 onboarding flow
+ * is what calls this.
+ *
+ * @param {string} cwd
+ * @param {{ now?: string }} [options]
+ * @returns {AutoReviewState}
+ */
+export function markOnboarded(cwd, options = {}) {
+  return updateState(cwd, (state) => {
+    if (!state.config.onboardedAt) {
+      state.config.onboardedAt = options.now ?? nowIso();
+    }
+  });
+}
+
+/**
+ * Read the accumulated review-gap accumulator (F3) — flattened unverified
+ * claims across reviews, newest last.
+ *
+ * @param {string} cwd
+ * @returns {ReviewGap[]}
+ */
+export function listReviewGaps(cwd) {
+  const gaps = loadState(cwd).reviewGaps;
+  return Array.isArray(gaps) ? gaps : [];
+}
+
+/**
+ * Append a review's unverified-claim gaps to the accumulator, in one locked
+ * pass. `gaps` is normally a review's `result.unverified[]`; each entry is
+ * stamped with the originating `reviewId`/`kind`/timestamp. No-op for an empty
+ * list. The accumulator is capped to the newest {@link MAX_REVIEW_GAPS} on
+ * save.
+ *
+ * @param {string} cwd
+ * @param {object} params
+ * @param {string} params.reviewId
+ * @param {"plan" | "code"} params.kind
+ * @param {Array<{ gap: string, suggestedOracle: string, critical?: boolean }>} params.gaps
+ * @returns {AutoReviewState}
+ */
+export function appendReviewGaps(cwd, params) {
+  const incoming = Array.isArray(params.gaps) ? params.gaps : [];
+  if (incoming.length === 0) {
+    return loadState(cwd);
+  }
+  return updateState(cwd, (state) => {
+    const recordedAt = nowIso();
+    if (!Array.isArray(state.reviewGaps)) {
+      state.reviewGaps = [];
+    }
+    for (const entry of incoming) {
+      if (!entry || typeof entry.gap !== "string" || !entry.gap.trim()) {
+        continue;
+      }
+      state.reviewGaps.push({
+        gap: entry.gap,
+        suggestedOracle:
+          typeof entry.suggestedOracle === "string" ? entry.suggestedOracle : "",
+        critical: Boolean(entry.critical),
+        reviewId: params.reviewId,
+        kind: params.kind === "plan" ? "plan" : "code",
+        recordedAt
+      });
+    }
+  });
+}
+
+/**
+ * Read the accept/reject memory (F3) — findings the user explicitly dismissed.
+ *
+ * @param {string} cwd
+ * @returns {DismissedFinding[]}
+ */
+export function listDismissedFindings(cwd) {
+  const dismissed = loadState(cwd).config.dismissedFindings;
+  return Array.isArray(dismissed) ? dismissed : [];
+}
+
+/**
+ * Whether a finding fingerprint is in the accept/reject memory — i.e. the user
+ * has dismissed it before and later reviews should not re-surface it.
+ *
+ * @param {string} cwd
+ * @param {string} fingerprint
+ * @returns {boolean}
+ */
+export function isFindingDismissed(cwd, fingerprint) {
+  if (typeof fingerprint !== "string" || !fingerprint) {
+    return false;
+  }
+  return listDismissedFindings(cwd).some((entry) => entry && entry.fingerprint === fingerprint);
+}
+
+/**
+ * Record a finding as dismissed (accept/reject memory, F3). Idempotent on the
+ * fingerprint: a repeated dismissal updates the disposition/note in place
+ * rather than duplicating. Phase 1 provides the accessor; Phase 2C's
+ * accept/reject UX is what calls it.
+ *
+ * @param {string} cwd
+ * @param {object} params
+ * @param {string} params.fingerprint
+ * @param {"accepted" | "rejected"} params.disposition
+ * @param {string | null} [params.note]
+ * @returns {AutoReviewState}
+ */
+export function dismissFinding(cwd, params) {
+  const fingerprint = typeof params.fingerprint === "string" ? params.fingerprint.trim() : "";
+  if (!fingerprint) {
+    return loadState(cwd);
+  }
+  const disposition = params.disposition === "rejected" ? "rejected" : "accepted";
+  return updateState(cwd, (state) => {
+    if (!Array.isArray(state.config.dismissedFindings)) {
+      state.config.dismissedFindings = [];
+    }
+    const existing = state.config.dismissedFindings.find(
+      (entry) => entry && entry.fingerprint === fingerprint
+    );
+    const dismissedAt = nowIso();
+    if (existing) {
+      existing.disposition = disposition;
+      existing.dismissedAt = dismissedAt;
+      existing.note = params.note ?? existing.note ?? null;
+      return;
+    }
+    state.config.dismissedFindings.push({
+      fingerprint,
+      disposition,
+      dismissedAt,
+      note: params.note ?? null
+    });
+  });
+}
+
+/**
+ * Resolve the per-model pricing rate override for `model` from the project
+ * config (F6) — `null` when the project has set no override for it. Wins over
+ * the hardcoded `pricing.mjs` table; the rate resolution order is
+ * flag → this → table → unknown.
+ *
+ * @param {string} cwd
+ * @param {string} model
+ * @returns {{ in: number, cachedIn?: number, out: number } | null}
+ */
+export function getPricingOverride(cwd, model) {
+  if (typeof model !== "string" || !model.trim()) {
+    return null;
+  }
+  const pricing = loadState(cwd).config.pricing;
+  if (!pricing || typeof pricing !== "object") {
+    return null;
+  }
+  const entry = pricing[model.trim()];
+  return entry && typeof entry === "object" ? entry : null;
 }

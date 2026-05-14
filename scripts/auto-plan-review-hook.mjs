@@ -135,6 +135,9 @@ function main() {
     cwd,
     kind: "plan",
     prompt: buildPlanReviewPrompt(planText),
+    // Pass the raw plan text so the F4 planHash anchors to the plan itself,
+    // not the prompt-wrapped form.
+    planText,
     config,
     sessionId: typeof input.session_id === "string" ? input.session_id : null
   });
