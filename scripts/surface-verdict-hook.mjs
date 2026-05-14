@@ -114,7 +114,9 @@ function main() {
     return;
   }
 
-  const pending = getUnsurfacedCompletedReviews(workspaceRoot);
+  // Scope to this session: never consume (and mark surfaced) a verdict that
+  // belongs to a different Claude session running on the same repo.
+  const pending = getUnsurfacedCompletedReviews(workspaceRoot, { sessionId });
   if (pending.length === 0) {
     return;
   }

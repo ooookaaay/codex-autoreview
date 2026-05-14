@@ -97,14 +97,19 @@ export function dispatchBackgroundReview(params) {
       [WORKER_SCRIPT, "--cwd", cwd, "--review-id", reviewId],
       { cwd, env: childEnv }
     );
-    // Attach the worker pid, but only while the review is still `queued`. By the
-    // time this runs the detached worker may already have advanced the status to
-    // `running`/`completed`/`failed`; a conditional patch makes this a
-    // compare-and-set so it can never roll a finished review back to `queued`.
+    // Attach the worker pid so SessionEnd cleanup can find and kill the process
+    // tree. By the time this runs the detached worker may already have advanced
+    // the status; the conditional patch is a compare-and-set that:
+    //   - still applies while the review is `queued` OR `running` (the worker
+    //     racing ahead to `running` must NOT cause the pid to be dropped — that
+    //     would leave the worker un-killable);
+    //   - never touches a `completed`/`failed` review (cannot roll it back);
+    //   - never overwrites a pid the worker may already have recorded.
     updateReviewIf(
       workspaceRoot,
       reviewId,
-      (review) => review.status === "queued",
+      (review) =>
+        (review.status === "queued" || review.status === "running") && !review.pid,
       { pid: pid ?? null }
     );
     return { dispatched: true, reviewId, detail: null };

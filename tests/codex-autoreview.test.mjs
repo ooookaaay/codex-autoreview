@@ -628,6 +628,30 @@ test("updateReviewIf only patches when the predicate holds (compare-and-set)", (
   );
 });
 
+test("dispatcher pid predicate still attaches when the worker raced to 'running'", () => {
+  // Regression: the pid must be attached for queued OR running reviews (a
+  // worker that flips to 'running' before the parent's pid write must NOT end
+  // up un-killable), but never for terminal reviews, and never overwriting an
+  // existing pid. This mirrors the predicate dispatchBackgroundReview uses.
+  const { repo } = setupRepo();
+  const predicate = (review) =>
+    (review.status === "queued" || review.status === "running") && !review.pid;
+
+  // Worker already advanced to 'running' before the parent's pid write.
+  upsertReview(repo, { id: "raced", kind: "code", status: "running" });
+  assert.equal(updateReviewIf(repo, "raced", predicate, { pid: 555 }).applied, true);
+  assert.equal(loadState(repo).reviews.find((r) => r.id === "raced").pid, 555);
+
+  // A pid already recorded is never overwritten.
+  assert.equal(updateReviewIf(repo, "raced", predicate, { pid: 999 }).applied, false);
+  assert.equal(loadState(repo).reviews.find((r) => r.id === "raced").pid, 555);
+
+  // A terminal review never gets a pid attached.
+  upsertReview(repo, { id: "terminal", kind: "code", status: "completed", verdict: "CLEAN: ok" });
+  assert.equal(updateReviewIf(repo, "terminal", predicate, { pid: 111 }).applied, false);
+  assert.equal(loadState(repo).reviews.find((r) => r.id === "terminal").pid, undefined);
+});
+
 test("concurrent updateState writers do not lose each other's updates", async () => {
   const { repo } = setupRepo();
   // Seed twenty distinct reviews from parallel writers; with an unsynchronized
@@ -922,6 +946,40 @@ test("surface-verdict hook injects a completed verdict exactly once", () => {
   });
   assert.equal(second.status, 0, second.stderr);
   assert.equal(second.stdout, "", "an already-surfaced verdict must not be re-injected");
+});
+
+test("surface-verdict hook is session-scoped — never steals another session's verdict", () => {
+  const { repo, binDir } = setupRepo();
+  run("node", [CLI, "config", "--enable", "--cwd", repo, "--json"], { env: buildEnv(binDir) });
+  // A completed verdict that belongs to session A.
+  upsertReview(repo, {
+    id: "owned-by-A",
+    kind: "code",
+    status: "completed",
+    verdict: "ISSUES: A's bug",
+    output: "ISSUES: A's bug\n\ndetails",
+    request: { cwd: repo, prompt: "x", sessionId: "session-A" }
+  });
+
+  // Session B must NOT see or consume session A's verdict.
+  const fromB = run("node", [SURFACE_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "session-B" }),
+    env: buildEnv(binDir)
+  });
+  assert.equal(fromB.status, 0, fromB.stderr);
+  assert.equal(fromB.stdout, "", "session B must not receive session A's verdict");
+  assert.ok(
+    !loadState(repo).reviews.find((r) => r.id === "owned-by-A").surfacedAt,
+    "session B must not mark session A's verdict surfaced"
+  );
+
+  // Session A still gets it.
+  const fromA = run("node", [SURFACE_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "session-A" }),
+    env: buildEnv(binDir)
+  });
+  assert.equal(fromA.status, 0, fromA.stderr);
+  assert.match(JSON.parse(fromA.stdout).hookSpecificOutput.additionalContext, /A's bug/);
 });
 
 test("surface-verdict hook ignores queued/running/failed reviews", () => {

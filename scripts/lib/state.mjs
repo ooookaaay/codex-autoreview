@@ -490,18 +490,39 @@ export function isReviewLikelyStuck(review, options = {}) {
  * Completed reviews that carry a verdict but have not yet been surfaced into a
  * Claude session, oldest first. The `UserPromptSubmit` hook injects these.
  *
+ * When `sessionId` is given, the result is scoped to that session: a review is
+ * eligible only if it was dispatched by this session (`request.sessionId`
+ * matches) or carries no session attribution at all. This prevents one Claude
+ * session from consuming — and marking surfaced — another session's verdict for
+ * the same repo, which would mean the originating session never sees it.
+ *
  * @param {string} cwd
+ * @param {{ sessionId?: string | null }} [options]
  * @returns {ReviewRecord[]}
  */
-export function getUnsurfacedCompletedReviews(cwd) {
+export function getUnsurfacedCompletedReviews(cwd, options = {}) {
+  const sessionId = options.sessionId ?? null;
   return listReviews(cwd)
-    .filter(
-      (review) =>
-        review.status === "completed" &&
-        typeof review.verdict === "string" &&
-        review.verdict.trim() &&
-        !review.surfacedAt
-    )
+    .filter((review) => {
+      if (
+        review.status !== "completed" ||
+        typeof review.verdict !== "string" ||
+        !review.verdict.trim() ||
+        review.surfacedAt
+      ) {
+        return false;
+      }
+      if (!sessionId) {
+        return true;
+      }
+      const reviewSession =
+        review.request && typeof review.request === "object"
+          ? review.request.sessionId
+          : undefined;
+      // Eligible for this session if it owns the review, or the review has no
+      // session attribution (then any session may surface it).
+      return !reviewSession || reviewSession === sessionId;
+    })
     .sort((left, right) =>
       String(left.updatedAt ?? "").localeCompare(String(right.updatedAt ?? ""))
     );
