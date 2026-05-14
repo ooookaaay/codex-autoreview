@@ -167,38 +167,34 @@ function killSessionWorkers(reviews, sessionId) {
 }
 
 /**
- * Remove this session's own stale per-review log/output files for reviews that
- * are no longer in state (i.e. were just pruned). Only files inside the
- * plugin's own reviews directory are ever touched.
+ * Remove the per-review log/output files for the reviews that were EXPLICITLY
+ * pruned from state by `reconcileAndPruneReviews` (terminal reviews only — see
+ * that function). Files are removed strictly by the pruned-id allowlist, never
+ * by "anything not in current state": that broader rule would delete files
+ * belonging to another active session's still-running review. Only files
+ * inside the plugin's own reviews directory are ever touched.
  *
  * @param {string} workspaceRoot
- * @param {Set<string>} survivingReviewIds
+ * @param {string[]} prunedReviewIds
  * @returns {number} count of files removed
  */
-function pruneOrphanReviewFiles(workspaceRoot, survivingReviewIds) {
-  const reviewsDir = resolveReviewsDir(workspaceRoot);
-  let removed = 0;
-  let entries;
-  try {
-    entries = fs.readdirSync(reviewsDir);
-  } catch {
+function removePrunedReviewFiles(workspaceRoot, prunedReviewIds) {
+  if (prunedReviewIds.length === 0) {
     return 0;
   }
-  for (const entry of entries) {
-    // Files are named "<reviewId>.log" / "<reviewId>.output.txt". Keep anything
-    // belonging to a review still in state; drop the rest.
-    const match = entry.match(/^(.+?)\.(log|output\.txt)$/);
-    if (!match) {
-      continue;
-    }
-    if (survivingReviewIds.has(match[1])) {
-      continue;
-    }
-    try {
-      fs.rmSync(path.join(reviewsDir, entry), { force: true });
-      removed += 1;
-    } catch {
-      // Best-effort; ignore.
+  const reviewsDir = resolveReviewsDir(workspaceRoot);
+  let removed = 0;
+  for (const reviewId of prunedReviewIds) {
+    for (const suffix of [".log", ".output.txt"]) {
+      const file = path.join(reviewsDir, `${reviewId}${suffix}`);
+      try {
+        if (fs.existsSync(file)) {
+          fs.rmSync(file, { force: true });
+          removed += 1;
+        }
+      } catch {
+        // Best-effort; ignore.
+      }
     }
   }
   return removed;
@@ -223,13 +219,16 @@ function main() {
   const killed = killSessionWorkers(reviewsBefore, sessionId);
 
   // 2. Reconcile this session's in-flight reviews to terminal + prune old ones.
-  const { reconciled, pruned, kept } = reconcileAndPruneReviews(workspaceRoot, {
+  //    Pruning only ever removes TERMINAL reviews; another active session's
+  //    queued/running review is always kept.
+  const { reconciled, pruned, kept, prunedIds } = reconcileAndPruneReviews(workspaceRoot, {
     sessionId
   });
 
-  // 3. Drop log/output files for reviews that no longer exist in state.
-  const survivingIds = new Set(listReviews(workspaceRoot).map((review) => review.id));
-  const filesRemoved = pruneOrphanReviewFiles(workspaceRoot, survivingIds);
+  // 3. Drop log/output files ONLY for the reviews that were explicitly pruned
+  //    above — never for "anything not in current state", which would clobber
+  //    another active session's still-running review files.
+  const filesRemoved = removePrunedReviewFiles(workspaceRoot, prunedIds);
 
   logNote(
     `codex-autoreview: session cleanup — killed ${killed} worker(s), ` +

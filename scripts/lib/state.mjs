@@ -566,7 +566,7 @@ export function markReviewsSurfaced(cwd, reviewIds, options = {}) {
  *
  * @param {string} cwd
  * @param {{ sessionId?: string | null, now?: number, maxAgeMs?: number, keepRecent?: number }} [options]
- * @returns {{ reconciled: number, pruned: number, kept: number }}
+ * @returns {{ reconciled: number, pruned: number, kept: number, prunedIds: string[] }}
  */
 export function reconcileAndPruneReviews(cwd, options = {}) {
   const sessionId = options.sessionId ?? null;
@@ -574,8 +574,9 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
   const maxAgeMs = options.maxAgeMs ?? 24 * 60 * 60 * 1000;
   const keepRecent = Math.max(1, options.keepRecent ?? 5);
   let reconciled = 0;
-  let pruned = 0;
   let kept = 0;
+  /** @type {string[]} */
+  const prunedIds = [];
 
   updateState(cwd, (state) => {
     // 1. Reconcile this session's still-in-flight reviews to a terminal state.
@@ -595,8 +596,12 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
       }
     }
 
-    // 2. Prune by age + count, but always keep the most recent few terminal
-    //    reviews so `last` still has something to show after a clear.
+    // 2. Prune by age + count. CRITICAL: only TERMINAL reviews are ever
+    //    eligible. A `queued`/`running` review is always kept — it may belong
+    //    to ANOTHER active Claude session on this repo whose worker is still
+    //    running; deleting its record (and, downstream, its files) would let
+    //    that worker recreate a corrupt partial record on completion. The most
+    //    recent few terminal reviews are also always kept so `last` still works.
     const sorted = [...state.reviews].sort((left, right) =>
       String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
     );
@@ -604,18 +609,20 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
     const survivors = [];
     for (let index = 0; index < sorted.length; index += 1) {
       const review = sorted[index];
+      const isTerminal = review.status === "completed" || review.status === "failed";
       const updatedAt = Date.parse(String(review.updatedAt ?? ""));
       const tooOld = Number.isFinite(updatedAt) && now - updatedAt > maxAgeMs;
       const overKeepBudget = index >= keepRecent;
-      if (index < keepRecent || (!tooOld && !overKeepBudget)) {
+      const prunable = isTerminal && (tooOld || overKeepBudget) && index >= keepRecent;
+      if (prunable) {
+        prunedIds.push(review.id);
+      } else {
         survivors.push(review);
         kept += 1;
-      } else {
-        pruned += 1;
       }
     }
     state.reviews = survivors;
   });
 
-  return { reconciled, pruned, kept };
+  return { reconciled, pruned: prunedIds.length, kept, prunedIds };
 }

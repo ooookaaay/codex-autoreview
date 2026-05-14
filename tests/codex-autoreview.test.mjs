@@ -1086,21 +1086,34 @@ test("session-end hook reconciles this session's in-flight reviews to failed", (
   assert.equal(kept.status, "completed", "completed reviews are kept so /last still works");
 });
 
-test("session-end hook prunes stale review files but keeps recent state", () => {
+test("session-end hook prunes old TERMINAL review files but keeps recent state", () => {
   const { repo, binDir } = setupRepo();
   const reviewsDir = path.join(resolveStateDir(repo), "reviews");
   fs.mkdirSync(reviewsDir, { recursive: true });
-  // A log file for a review that is NOT in state (orphan) and one that IS.
-  fs.writeFileSync(path.join(reviewsDir, "orphan-xyz.log"), "stale\n", "utf8");
-  fs.writeFileSync(path.join(reviewsDir, "orphan-xyz.output.txt"), "stale\n", "utf8");
-  upsertReview(repo, {
-    id: "live-rev",
-    kind: "code",
-    status: "completed",
-    verdict: "CLEAN: ok",
-    output: "CLEAN: ok"
-  });
-  fs.writeFileSync(path.join(reviewsDir, "live-rev.log"), "kept\n", "utf8");
+
+  // Seed > keepRecent (5) terminal reviews, all old, so the oldest get pruned.
+  // Each review with a log file. The newest few must survive (so /last works).
+  for (let index = 0; index < 9; index += 1) {
+    const id = `old-term-${index}`;
+    upsertReview(repo, {
+      id,
+      kind: "code",
+      status: "completed",
+      verdict: "CLEAN: ok",
+      output: "CLEAN: ok"
+    });
+    fs.writeFileSync(path.join(reviewsDir, `${id}.log`), "log\n", "utf8");
+  }
+  // Backdate them all well past the 24h age bound.
+  const aged = loadState(repo);
+  for (const review of aged.reviews) {
+    review.updatedAt = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+  }
+  fs.writeFileSync(
+    path.join(resolveStateDir(repo), "state.json"),
+    `${JSON.stringify(aged, null, 2)}\n`,
+    "utf8"
+  );
 
   const result = run("node", [SESSION_END_HOOK], {
     input: JSON.stringify({ cwd: repo, session_id: "s1" }),
@@ -1108,15 +1121,76 @@ test("session-end hook prunes stale review files but keeps recent state", () => 
   });
   assert.equal(result.status, 0, result.stderr);
 
-  assert.equal(fs.existsSync(path.join(reviewsDir, "orphan-xyz.log")), false, "orphan log removed");
-  assert.equal(
-    fs.existsSync(path.join(reviewsDir, "orphan-xyz.output.txt")),
-    false,
-    "orphan output removed"
+  const survivors = loadState(repo).reviews;
+  // keepRecent = 5 → exactly 5 survive, 4 pruned.
+  assert.equal(survivors.length, 5, "the most recent 5 terminal reviews are kept");
+  // Pruned reviews' files are gone; kept reviews' files remain.
+  const survivingIds = new Set(survivors.map((r) => r.id));
+  let prunedFilesGone = 0;
+  let keptFilesPresent = 0;
+  for (let index = 0; index < 9; index += 1) {
+    const file = path.join(reviewsDir, `old-term-${index}.log`);
+    if (survivingIds.has(`old-term-${index}`)) {
+      if (fs.existsSync(file)) keptFilesPresent += 1;
+    } else if (!fs.existsSync(file)) {
+      prunedFilesGone += 1;
+    }
+  }
+  assert.equal(prunedFilesGone, 4, "pruned reviews' files are removed");
+  assert.equal(keptFilesPresent, 5, "kept reviews' files are preserved");
+});
+
+test("session-end hook NEVER prunes another active session's running review or files", () => {
+  const { repo, binDir } = setupRepo();
+  const reviewsDir = path.join(resolveStateDir(repo), "reviews");
+  fs.mkdirSync(reviewsDir, { recursive: true });
+
+  // Another session (session-B) has an OLD queued review still in flight, with
+  // its log + output files. Even though it is old and over any keep budget, a
+  // session-A cleanup must NOT prune it — its worker may still be running.
+  upsertReview(repo, {
+    id: "B-inflight",
+    kind: "plan",
+    status: "running",
+    request: { cwd: repo, prompt: "x", sessionId: "session-B" }
+  });
+  // Pad with many old terminal reviews so the keep-budget pressure is real.
+  for (let index = 0; index < 8; index += 1) {
+    upsertReview(repo, { id: `pad-${index}`, kind: "code", status: "completed", verdict: "CLEAN: ok" });
+  }
+  const aged = loadState(repo);
+  for (const review of aged.reviews) {
+    review.updatedAt = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
+  }
+  fs.writeFileSync(
+    path.join(resolveStateDir(repo), "state.json"),
+    `${JSON.stringify(aged, null, 2)}\n`,
+    "utf8"
   );
-  assert.equal(fs.existsSync(path.join(reviewsDir, "live-rev.log")), true, "live review file kept");
-  // The completed review itself is still there for /last.
-  assert.ok(loadState(repo).reviews.find((r) => r.id === "live-rev"));
+  fs.writeFileSync(path.join(reviewsDir, "B-inflight.log"), "B's log\n", "utf8");
+  fs.writeFileSync(path.join(reviewsDir, "B-inflight.output.txt"), "B's output\n", "utf8");
+
+  // Session A ends.
+  const result = run("node", [SESSION_END_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "session-A" }),
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  // Session B's running review must still be in state, still running, untouched.
+  const bReview = loadState(repo).reviews.find((r) => r.id === "B-inflight");
+  assert.ok(bReview, "another session's running review must NOT be pruned from state");
+  assert.equal(bReview.status, "running", "another session's review must NOT be reconciled");
+  assert.equal(bReview.kind, "plan", "its kind/attribution must be intact");
+  // And its files must survive — its worker may still write the verdict.
+  assert.ok(
+    fs.existsSync(path.join(reviewsDir, "B-inflight.log")),
+    "another session's review log must NOT be deleted"
+  );
+  assert.ok(
+    fs.existsSync(path.join(reviewsDir, "B-inflight.output.txt")),
+    "another session's review output must NOT be deleted"
+  );
 });
 
 test("session-end hook never errors out, even with no state and no session id", () => {
