@@ -22,6 +22,7 @@
  * @file
  */
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -64,32 +65,63 @@ function logNote(message) {
 }
 
 /**
- * Best-effort check that a pid is still a codex-autoreview review worker, so we
- * never signal an unrelated process that happens to have reused the pid. Uses
- * `/proc` on Linux; on other platforms it returns `true` (the pid came from our
- * own state, which is already a strong signal) so cleanup still proceeds.
+ * Read a process's command line by pid, or `null` if it cannot be determined.
+ *
+ * Uses `/proc/<pid>/cmdline` on Linux and `ps -p <pid> -o command=` elsewhere
+ * (macOS / other Unix). Returning `null` means "could not verify" — the caller
+ * MUST NOT kill in that case, to avoid signalling an unrelated process that has
+ * reused the pid.
  *
  * @param {number} pid
- * @returns {boolean}
+ * @returns {string | null}
  */
-function looksLikeReviewWorker(pid) {
+function readProcessCommand(pid) {
+  // Linux: /proc is authoritative and cheap.
   try {
     const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
-    return cmdline.includes("review-worker.mjs");
-  } catch (error) {
-    const code = /** @type {NodeJS.ErrnoException} */ (error).code;
-    if (code === "ENOENT") {
-      // No /proc entry: either not Linux, or the process is already gone.
-      // Fall back to a liveness probe; if it is alive, trust our own state.
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
+    if (cmdline) {
+      // /proc/<pid>/cmdline is NUL-separated.
+      return cmdline.split("\0").join(" ").trim();
     }
+  } catch {
+    // Not Linux, or the process is gone — fall through to `ps`.
+  }
+  // Other platforms: ask `ps`. If `ps` is unavailable or the pid is gone,
+  // there is no command to return, so the caller treats it as unverifiable.
+  try {
+    const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+      encoding: "utf8",
+      timeout: 3000
+    });
+    if (result.status === 0) {
+      const command = (result.stdout ?? "").trim();
+      return command || null;
+    }
+  } catch {
+    // `ps` not available — unverifiable.
+  }
+  return null;
+}
+
+/**
+ * Verify a pid is genuinely THIS codex-autoreview review worker before we
+ * signal it — guarding against pid reuse (a stale pid in state now belonging to
+ * an unrelated process). Requires the command line to contain BOTH
+ * `review-worker.mjs` AND this review's `--review-id`. If the command line
+ * cannot be determined at all, returns `false` (skip the kill) rather than
+ * guessing — an un-killed worker is reconciled in state anyway, but signalling
+ * the wrong process would be unsafe.
+ *
+ * @param {number} pid
+ * @param {string} reviewId
+ * @returns {boolean}
+ */
+function looksLikeReviewWorker(pid, reviewId) {
+  const command = readProcessCommand(pid);
+  if (!command) {
     return false;
   }
+  return command.includes("review-worker.mjs") && command.includes(reviewId);
 }
 
 /**
@@ -113,7 +145,10 @@ function killSessionWorkers(reviews, sessionId) {
       continue;
     }
     const pid = typeof review.pid === "number" && review.pid > 0 ? review.pid : null;
-    if (!pid || !looksLikeReviewWorker(pid)) {
+    if (!pid || !looksLikeReviewWorker(pid, review.id)) {
+      // Either no pid recorded, the process is gone, or it could not be
+      // positively verified as this review's worker — skip the kill. The
+      // review is still reconciled to a terminal state below regardless.
       continue;
     }
     try {

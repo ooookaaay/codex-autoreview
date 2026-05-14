@@ -1128,3 +1128,71 @@ test("session-end hook never errors out, even with no state and no session id", 
   });
   assert.equal(result.status, 0, "cleanup hook must always exit 0 to not disrupt shutdown");
 });
+
+test("session-end hook kills only a VERIFIED review worker, never a reused pid", async () => {
+  const { repo } = setupRepo();
+  const { spawn } = await import("node:child_process");
+
+  // (a) An UNRELATED long-lived process whose pid we deliberately mis-record on
+  //     an in-flight review — simulating pid reuse / stale state. It must NOT
+  //     be killed: its command line is not a review-worker.
+  const bystander = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], {
+    stdio: "ignore"
+  });
+  // (b) A genuine review-worker for a real seeded review — it should be killed.
+  //     Use a hanging codex so the worker stays alive in `running`.
+  const binDir = makeTempDir();
+  installHangingCodex(binDir);
+  const realReviewId = seedQueuedReview(repo, {
+    timeoutMs: 120_000,
+    sessionId: "cleanup-sess"
+  });
+  const realWorker = spawn(
+    "node",
+    [WORKER, "--cwd", repo, "--review-id", realReviewId],
+    { env: buildEnv(binDir), stdio: "ignore" }
+  );
+  await waitFor(
+    () => loadState(repo).reviews.find((r) => r.id === realReviewId)?.status === "running",
+    { timeoutMs: 8000, intervalMs: 100 }
+  );
+
+  // Record the real worker's pid on the real review, and the bystander's pid on
+  // a separate fake in-flight review for the same session.
+  upsertReview(repo, { id: realReviewId, pid: realWorker.pid });
+  upsertReview(repo, {
+    id: "fake-inflight",
+    kind: "code",
+    status: "running",
+    pid: bystander.pid,
+    request: { cwd: repo, prompt: "x", sessionId: "cleanup-sess" }
+  });
+
+  const result = run("node", [SESSION_END_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "cleanup-sess" }),
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  // The genuine review-worker must have been reaped.
+  const realWorkerGone = await waitFor(
+    () => realWorker.exitCode !== null || realWorker.signalCode !== null,
+    { timeoutMs: 8000, intervalMs: 100 }
+  );
+  assert.ok(realWorkerGone, "the verified review-worker should have been killed");
+
+  // The unrelated bystander must still be alive — it was never a review-worker.
+  let bystanderAlive = true;
+  try {
+    process.kill(bystander.pid, 0);
+  } catch {
+    bystanderAlive = false;
+  }
+  assert.ok(bystanderAlive, "an unrelated reused pid must NOT be signalled");
+  bystander.kill("SIGKILL");
+
+  // Both in-flight reviews are still reconciled to a terminal state regardless.
+  const reviews = loadState(repo).reviews;
+  assert.equal(reviews.find((r) => r.id === realReviewId).status, "failed");
+  assert.equal(reviews.find((r) => r.id === "fake-inflight").status, "failed");
+});
