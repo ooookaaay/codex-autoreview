@@ -2,13 +2,20 @@
 /**
  * Stop hook.
  *
- * When the per-project toggle is on, sends the repository's code changes to
- * Codex for a bug-finding review. The review runs as a detached background job;
- * this hook dispatches it and returns immediately. It never emits a blocking
- * decision, so the Stop event is never blocked — the review is advisory.
+ * When the per-project toggle is on AND the workspace is onboarded, sends the
+ * repository's code changes to Codex for a bug-finding review. The review runs
+ * as a detached background job; this hook dispatches it and returns
+ * immediately. It never emits a blocking decision, so the Stop event is never
+ * blocked — the review is advisory.
  *
- * No-ops cleanly when: the toggle is off, there is nothing reviewable in the
- * working tree, or the `codex` CLI is absent.
+ * No-ops cleanly when: stdin is missing/empty/malformed JSON, the toggle is
+ * off, the workspace is not yet onboarded, there is nothing reviewable in the
+ * working tree, an equivalent review already covers the change (dedupe), or the
+ * `codex` CLI is absent.
+ *
+ * The hook no longer renders the review prompt itself — it dispatches review
+ * METADATA plus the redactable builder's-message text; the detached worker
+ * assembles the prompt and redacts that text from state once it has read it.
  *
  * @file
  */
@@ -16,32 +23,39 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
 import { dispatchBackgroundReview } from "./lib/auto-review.mjs";
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { getWorkingTreeState } from "./lib/git.mjs";
-import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig } from "./lib/state.mjs";
+import { getConfig, isOnboarded } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
+const PROJECT_INSTRUCTIONS_FILE = ".codex-autoreview.md";
 
 /**
- * @returns {Record<string, unknown>}
+ * Read and parse the hook's stdin JSON. A missing, empty, or MALFORMED stdin
+ * payload yields `null` — the caller treats that as a clean no-op (exit 0, no
+ * dispatch) rather than crashing the hook.
+ *
+ * @returns {Record<string, unknown> | null}
  */
 function readHookInput() {
   let raw = "";
   try {
     raw = fs.readFileSync(0, "utf8").trim();
   } catch {
-    return {};
+    return null;
   }
   if (!raw) {
-    return {};
+    return null;
   }
-  return JSON.parse(raw);
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? /** @type {Record<string, unknown>} */ (parsed) : null;
+  } catch {
+    // Malformed JSON on stdin — a clean no-op, never a crash.
+    return null;
+  }
 }
 
 /**
@@ -55,22 +69,28 @@ function logNote(message) {
 }
 
 /**
- * @param {Record<string, unknown>} input
- * @returns {string}
+ * Resolve the project's `.codex-autoreview.md` path when one exists at the
+ * workspace root, else `null`. Passed through to the worker's prompt assembler.
+ *
+ * @param {string} workspaceRoot
+ * @returns {string | null}
  */
-function buildCodeReviewPrompt(input) {
-  const lastAssistantMessage = String(input.last_assistant_message ?? "").trim();
-  const template = loadPromptTemplate(ROOT_DIR, "auto-code-review");
-  const claudeResponseBlock = lastAssistantMessage
-    ? ["Context from Claude's previous response:", lastAssistantMessage].join("\n")
-    : "";
-  return interpolateTemplate(template, {
-    CLAUDE_RESPONSE_BLOCK: claudeResponseBlock
-  });
+function resolveProjectInstructionsPath(workspaceRoot) {
+  const candidate = path.join(workspaceRoot, PROJECT_INSTRUCTIONS_FILE);
+  try {
+    return fs.existsSync(candidate) ? candidate : null;
+  } catch {
+    return null;
+  }
 }
 
 function main() {
   const input = readHookInput();
+  // Malformed / empty stdin — clean no-op.
+  if (!input) {
+    return;
+  }
+
   const cwd =
     (typeof input.cwd === "string" && input.cwd) ||
     process.env.CLAUDE_PROJECT_DIR ||
@@ -80,6 +100,16 @@ function main() {
 
   // No-op cleanly when the per-project toggle is off.
   if (!config.enabled) {
+    return;
+  }
+
+  // Onboarding gate: until the guided onboarding flow has completed for this
+  // workspace, the review hooks no-op. The SessionStart onboarding hook keeps
+  // reminding the user; this is not a hard error.
+  if (!isOnboarded(workspaceRoot)) {
+    logNote(
+      "codex-autoreview: code review skipped — finish onboarding first (run /codex-autoreview:onboard)."
+    );
     return;
   }
 
@@ -104,15 +134,26 @@ function main() {
   // Dispatch the bug-finding review as a detached background job and return
   // immediately. The Stop event is never blocked; the verdict surfaces later
   // through /codex-autoreview:last and the statusline.
+  const claudeResponseBlock = String(input.last_assistant_message ?? "").trim();
   const dispatch = dispatchBackgroundReview({
     cwd,
     kind: "code",
-    prompt: buildCodeReviewPrompt(input),
+    // The hook no longer renders the prompt — it hands over the redactable
+    // builder's-message text and lets the worker assemble.
+    claudeResponseBlock: claudeResponseBlock || undefined,
+    projectInstructionsPath: resolveProjectInstructionsPath(workspaceRoot),
+    trigger: "stop",
     config,
     sessionId: typeof input.session_id === "string" ? input.session_id : null
   });
 
   if (!dispatch.dispatched) {
+    if (dispatch.deduped) {
+      logNote(
+        `codex-autoreview: code review skipped — ${dispatch.detail ?? "an equivalent review already covers this change."}`
+      );
+      return;
+    }
     logNote(
       dispatch.detail
         ? `codex-autoreview: code review dispatch failed: ${dispatch.detail}`

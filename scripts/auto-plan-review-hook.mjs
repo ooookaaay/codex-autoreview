@@ -2,13 +2,19 @@
 /**
  * PreToolUse / ExitPlanMode hook.
  *
- * When the per-project toggle is on, sends Claude's plan to Codex for a
- * devil's-advocate review. The review runs as a detached background job; this
- * hook dispatches it and returns immediately. It never emits a permission
- * decision, so plan-mode exit is never blocked.
+ * When the per-project toggle is on AND the workspace is onboarded, sends
+ * Claude's plan to Codex for a devil's-advocate review. The review runs as a
+ * detached background job; this hook dispatches it and returns immediately. It
+ * never emits a permission decision, so plan-mode exit is never blocked.
  *
- * No-ops cleanly when: the toggle is off, the plan is too small to be worth a
- * review, or the `codex` CLI is absent.
+ * No-ops cleanly when: stdin is missing/empty/malformed JSON, the toggle is
+ * off, the workspace is not yet onboarded, the plan is too small to be worth a
+ * review, an equivalent review already covers this plan (dedupe), or the
+ * `codex` CLI is absent.
+ *
+ * The hook no longer renders the review prompt itself — it dispatches review
+ * METADATA plus the redactable plan text; the detached worker assembles the
+ * prompt and redacts the plan text from state as soon as it has read it.
  *
  * @file
  */
@@ -16,32 +22,39 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
 import { dispatchBackgroundReview } from "./lib/auto-review.mjs";
 import { getCodexAvailability } from "./lib/codex.mjs";
-import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig } from "./lib/state.mjs";
+import { getConfig, isOnboarded } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const MIN_REVIEWABLE_PLAN_CHARS = 240;
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
+const PROJECT_INSTRUCTIONS_FILE = ".codex-autoreview.md";
 
 /**
- * @returns {Record<string, unknown>}
+ * Read and parse the hook's stdin JSON. A missing, empty, or MALFORMED stdin
+ * payload yields `null` — the caller treats that as a clean no-op (exit 0, no
+ * dispatch) rather than crashing the hook.
+ *
+ * @returns {Record<string, unknown> | null}
  */
 function readHookInput() {
   let raw = "";
   try {
     raw = fs.readFileSync(0, "utf8").trim();
   } catch {
-    return {};
+    return null;
   }
   if (!raw) {
-    return {};
+    return null;
   }
-  return JSON.parse(raw);
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? /** @type {Record<string, unknown>} */ (parsed) : null;
+  } catch {
+    // Malformed JSON on stdin — a clean no-op, never a crash.
+    return null;
+  }
 }
 
 /**
@@ -84,16 +97,28 @@ function extractPlanText(input) {
 }
 
 /**
- * @param {string} planText
- * @returns {string}
+ * Resolve the project's `.codex-autoreview.md` path when one exists at the
+ * workspace root, else `null`. Passed through to the worker's prompt assembler.
+ *
+ * @param {string} workspaceRoot
+ * @returns {string | null}
  */
-function buildPlanReviewPrompt(planText) {
-  const template = loadPromptTemplate(ROOT_DIR, "auto-plan-review");
-  return interpolateTemplate(template, { PLAN_BLOCK: planText });
+function resolveProjectInstructionsPath(workspaceRoot) {
+  const candidate = path.join(workspaceRoot, PROJECT_INSTRUCTIONS_FILE);
+  try {
+    return fs.existsSync(candidate) ? candidate : null;
+  } catch {
+    return null;
+  }
 }
 
 function main() {
   const input = readHookInput();
+  // Malformed / empty stdin — clean no-op.
+  if (!input) {
+    return;
+  }
+
   const cwd =
     (typeof input.cwd === "string" && input.cwd) ||
     process.env.CLAUDE_PROJECT_DIR ||
@@ -103,6 +128,16 @@ function main() {
 
   // No-op cleanly when the per-project toggle is off.
   if (!config.enabled) {
+    return;
+  }
+
+  // Onboarding gate: until the guided onboarding flow has completed for this
+  // workspace, the review hooks no-op. The SessionStart onboarding hook keeps
+  // reminding the user; this is not a hard error.
+  if (!isOnboarded(workspaceRoot)) {
+    logNote(
+      "codex-autoreview: plan review skipped — finish onboarding first (run /codex-autoreview:onboard)."
+    );
     return;
   }
 
@@ -134,15 +169,23 @@ function main() {
   const dispatch = dispatchBackgroundReview({
     cwd,
     kind: "plan",
-    prompt: buildPlanReviewPrompt(planText),
-    // Pass the raw plan text so the F4 planHash anchors to the plan itself,
-    // not the prompt-wrapped form.
+    // The hook no longer renders the prompt — it hands over the redactable plan
+    // text and lets the worker assemble (and the F4 planHash anchors to the
+    // plan itself, not a prompt-wrapped form).
     planText,
+    projectInstructionsPath: resolveProjectInstructionsPath(workspaceRoot),
+    trigger: "exit-plan-mode",
     config,
     sessionId: typeof input.session_id === "string" ? input.session_id : null
   });
 
   if (!dispatch.dispatched) {
+    if (dispatch.deduped) {
+      logNote(
+        `codex-autoreview: plan review skipped — ${dispatch.detail ?? "an equivalent review already covers this plan."}`
+      );
+      return;
+    }
     logNote(
       dispatch.detail
         ? `codex-autoreview: plan review dispatch failed: ${dispatch.detail}`

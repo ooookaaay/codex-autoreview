@@ -1,13 +1,37 @@
 {
-  "description": "Automatic background Codex review: a devil's-advocate plan review on ExitPlanMode and a bug-finding code review on Stop, both dispatched as detached jobs that never block the session. A UserPromptSubmit hook injects finished verdicts back into the session context, and a SessionEnd hook cleans up the plugin's own workers and transient files.",
+  "description": "Automatic background Codex review: a devil's-advocate plan review on ExitPlanMode, a bug-finding code review on Stop, and a code review of about-to-push changes on a git push — all dispatched as detached jobs that never block the session. A SessionStart hook injects guided-onboarding context until the workspace is set up, a UserPromptSubmit hook injects finished verdicts back into the session context, and a SessionEnd hook cleans up the plugin's own workers and transient files. Hook commands use exec form (command + args[]) so ${CLAUDE_PLUGIN_ROOT} is passed as a literal argument with no shell quoting pitfalls.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/onboarding-hook.mjs"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "ExitPlanMode",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/auto-plan-review-hook.mjs\"",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/auto-plan-review-hook.mjs"],
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/pre-push-review-hook.mjs"],
             "timeout": 30
           }
         ]
@@ -18,7 +42,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/auto-code-review-hook.mjs\"",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/auto-code-review-hook.mjs"],
             "timeout": 30
           }
         ]
@@ -29,7 +54,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/surface-verdict-hook.mjs\"",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/surface-verdict-hook.mjs"],
             "timeout": 10
           }
         ]
@@ -40,7 +66,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-cleanup-hook.mjs\"",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/session-end-cleanup-hook.mjs"],
             "timeout": 15
           }
         ]
