@@ -29,7 +29,7 @@
         "claude-code-plugin",
         "background-review"
       ],
-      "source": "."
+      "source": "./plugins/codex-autoreview"
     }
   ]
 }
