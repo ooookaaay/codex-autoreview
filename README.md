@@ -1,172 +1,76 @@
 # codex-autoreview
 
-Самостоятельный плагин для [Claude Code](https://docs.claude.com/en/docs/claude-code),
-который автоматически отправляет планы и изменения кода Claude в **Codex CLI**
-на фоновую проверку.
+**A second pair of eyes for Claude Code — every plan and every code change, reviewed by Codex in the background.**
 
-Плагин **полностью независим** от плагина `codex` от OpenAI. Нужные части кода
-интеграции с Codex встроены (vendored) в этот репозиторий как библиотеки в
-`scripts/lib/`. Единственное внешнее требование — отдельно установленный
-`codex` CLI (см. раздел «Требования»).
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A518.18-339933.svg)](package.json)
+[![tests](https://img.shields.io/badge/tests-node%3Atest-brightgreen.svg)](tests/)
+[![version](https://img.shields.io/badge/version-0.3.0-orange.svg)](CHANGELOG.md)
 
-## Что делает плагин
+A standalone [Claude Code](https://docs.claude.com/en/docs/claude-code) plugin
+that sends Claude's plans and code changes to the **Codex CLI** for background
+review — as a *verifier, not a builder* — and surfaces the verdict back into
+your session. Non-blocking, advisory, and self-cleaning.
 
-Плагин подключает четыре хука Claude Code:
+It is **fully independent** of OpenAI's `codex` plugin: the integration code is
+vendored into `scripts/lib/`. The only external requirement is a separately
+installed `codex` CLI.
 
-1. **Проверка плана (devil's advocate).** Хук `PreToolUse` на инструменте
-   `ExitPlanMode` перехватывает план, который Claude собирается выполнить, и
-   отправляет его в Codex с ролью «адвоката дьявола» — Codex ищет самые сильные
-   причины, почему план не стоит выполнять как написано.
+---
 
-2. **Проверка кода (поиск багов).** Хук `Stop` после завершения хода Claude
-   отправляет незакоммиченные изменения рабочего дерева в Codex на проверку,
-   ориентированную на поиск реальных багов.
+## What it looks like
 
-3. **Возврат вердикта в сессию.** Хук `UserPromptSubmit` при следующем запросе
-   пользователя подхватывает уже **готовый** вердикт фоновой проверки и
-   подставляет его прямо в контекст сессии (`additionalContext`). Claude видит
-   находки Codex и сам решает, что из них принять. Запускать
-   `/codex-autoreview:last` вручную больше не обязательно — но команда остаётся.
+While a review runs, the statusline shows a live indicator:
 
-4. **Очистка при завершении сессии.** Хук `SessionEnd` при закрытии/очистке
-   сессии убивает «осиротевшие» фоновые процессы проверки этой сессии, переводит
-   её незавершённые проверки в терминальное состояние и подчищает старые записи
-   и файлы. Он **никогда** не трогает данные пользователя в `~/.codex`.
+```
+codex-autoreview: ⏳ code review · 1m23s
+```
 
-Проверки плана и кода **запускаются как отдельный фоновый процесс и сразу
-возвращают управление**. Главная сессия Claude никогда не блокируется:
+When it finishes, the next prompt gets the verdict injected as context — only
+what matters, not the raw report:
 
-- выход из режима плана (`ExitPlanMode`) никогда не запрещается;
-- событие `Stop` никогда не блокируется;
-- вердикт Codex появляется позже — он сам подставится в сессию хуком
-  `UserPromptSubmit`, либо его можно посмотреть командой `/codex-autoreview:last`.
+```
+ISSUES: off-by-one in the retry loop drops the last attempt
 
-Хуки делают «тихий no-op» (ничего не происходит), если:
+[high] retry budget exhausted one iteration early — src/retry.ts:42
+  impact: the final retry never runs; transient failures surface as hard errors
+  fix: use `<= maxRetries` instead of `< maxRetries`
 
-- проверка выключена для проекта;
-- проверять нечего (план слишком короткий или в рабочем дереве нет изменений);
-- `codex` CLI не установлен.
+tokens: 4180/910 · ~$0.03
+```
 
-### Защита от зависаний
+And when idle, the statusline reflects the last verdict: `CLEAN · VERIFIED`,
+`ISSUES · FEEDBACK`, `pending:2`, or `FAILED · stale`.
 
-Плагин рассчитан на то, что `codex` может оказаться медленным или зависнуть, и
-это **никогда** не должно ломать работу:
+---
 
-- у каждого вызова `codex exec` есть жёсткий таймаут (по умолчанию **240
-  секунд**, настраивается). По таймауту убивается всё дерево процессов `codex`,
-  а проверка помечается как `failed` — зависший Codex не оставит задачу в статусе
-  `running` навсегда;
-- фоновый процесс гарантированно доводит проверку до терминального состояния
-  (`completed`/`failed`) на любом пути ошибки, в том числе если сам процесс
-  убивают сигналом `SIGTERM`/`SIGINT`;
-- хуки `ExitPlanMode`/`Stop` только запускают фоновую задачу и сразу выходят —
-  они никогда не ждут результата и укладываются в свой 30-секундный таймаут;
-- `/codex-autoreview:last` помечает проверку, надолго «застрявшую» в `queued`/
-  `running`, как `LIKELY STUCK`, а не выдаёт её за здоровую;
-- проверка, «осиротевшая» из-за `SIGKILL` / OOM / краха процесса (единственный
-  путь в обход гарантии терминального состояния — этот сигнал нельзя
-  перехватить), **самовосстанавливается**: она автоматически переводится в
-  `failed` хуком `SessionEnd` и при следующем запуске проверки, так что
-  «зависшая» запись не остаётся навсегда.
+## Install
 
-## Установка
+```sh
+# 1. Install the Codex CLI separately (the plugin does not bundle it)
+npm install -g @openai/codex
+codex login            # if your model provider requires it
 
-1. Установите `codex` CLI отдельно (см. «Требования»).
-2. Подключите плагин в Claude Code как локальный плагин — добавьте каталог
-   `codex-autoreview` в маркетплейс плагинов или укажите путь к нему в настройках
-   Claude Code (`/plugin`). Манифест плагина — `.claude-plugin/plugin.json`.
-3. Зависимостей из npm у плагина нет — устанавливать ничего не нужно. Требуется
-   только Node.js >= 18.18.0 (его же использует Claude Code).
+# 2. Add the plugin to Claude Code (/plugin) — point it at this directory.
+#    No npm dependencies; Node >= 18.18 (the same one Claude Code uses).
+```
 
-После подключения хуки из `hooks/hooks.json` начинают работать автоматически,
-но по умолчанию проверка **выключена** для каждого проекта — её нужно включить.
+## Quick start
 
-## Включение и выключение
-
-Проверка настраивается **отдельно для каждого проекта** и сохраняется в состоянии
-плагина.
-
-Включить для текущего проекта:
+Reviews are **off per project** by default. Enable and onboard:
 
 ```
 /codex-autoreview:config --enable
+/codex-autoreview:onboard
 ```
 
-Выключить:
+`onboard` walks you through the rest (codex login → model/effort → statusline →
+optional `.codex-autoreview.md`). Until onboarding completes, the review hooks
+stay a clean no-op.
 
-```
-/codex-autoreview:config --disable
-```
-
-Посмотреть текущие настройки (без изменений):
-
-```
-/codex-autoreview:config
-```
-
-Команда также показывает, доступен ли `codex` CLI.
-
-## Настройка модели, reasoning effort и таймаута
-
-Можно задать модель Codex, уровень «усилий рассуждения» (reasoning effort) и
-жёсткий таймаут проверки:
-
-```
-/codex-autoreview:config --enable --model gpt-5.4-codex --effort high --timeout 180000
-```
-
-### `--effort <уровень>` — reasoning effort
-
-По умолчанию — **`medium`**. Важно: это **собственное значение по умолчанию
-плагина**, оно **не наследуется** из вашего глобального `~/.codex/config.toml`.
-Так сделано намеренно: если в глобальном конфиге выставлен медленный `xhigh`,
-автоматические фоновые проверки не должны из-за этого тормозить. `medium` — это
-быстрый отклик, но Codex всё ещё хватает «бюджета рассуждения», чтобы
-прослеживать межфайловую логику и находить реальные баги.
-
-Допустимые значения проверяются по тому, что принимает `codex` CLI:
-`none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
-
-> Примечание про `xhigh`: одно время это значение по ошибке встречалось в
-> документации как несуществующее, поэтому набор значений здесь явно
-> валидируется. `xhigh` входит в допустимый набор.
-
-### `--model <model>` — модель Codex
-
-По умолчанию модель **не задаётся** и наследуется из вашего
-`~/.codex/config.toml`. Это намеренное решение ради совместимости: жёстко
-прописанная модель может быть отвергнута аккаунтами с авторизацией через
-ChatGPT — такой аккаунт принимает только модели, на которые у него есть права.
-(В отличие от модели, `effort` безопасно фиксировать: любой аккаунт принимает
-любой уровень.)
-
-### `--timeout <мс>` — жёсткий таймаут одной проверки
-
-По умолчанию **240000 мс (240 секунд)**. По истечении таймаута дерево процессов
-`codex` убивается, а проверка помечается `failed`. Допустимый диапазон —
-`10000`–`1800000` мс.
-
-### Сброс к значениям по умолчанию
-
-Чтобы вернуть значение по умолчанию, передайте пустую строку:
-`--model ""`, `--effort ""` или `--timeout ""`.
-
-Неверное значение `--effort` или `--timeout` отклоняется с понятной ошибкой,
-настройки при этом не меняются.
-
-## Statusline
-
-Когда проверка включена, скрипт `scripts/statusline.mjs` печатает маркер:
-
-```
-codex-autoreview: ON (<модель>, <effort>)
-```
-
-Когда проверка выключена — скрипт не печатает ничего, статусная строка остаётся
-чистой.
-
-Чтобы маркер отображался, добавьте в настройки Claude Code запись `statusLine`,
-запускающую этот скрипт:
+To show the live statusline indicator, add this to your Claude Code
+`settings.json` (a plugin manifest cannot register `statusLine` — Claude Code
+does not honor that key from a plugin):
 
 ```json
 {
@@ -177,118 +81,234 @@ codex-autoreview: ON (<модель>, <effort>)
 }
 ```
 
-Если у вас уже есть своя статусная строка — не перезаписывайте её, а добавьте
-вызов этого скрипта как один из сегментов.
+If you already have a statusline, add this as one segment instead of replacing it.
 
-## Как появляются вердикты
+---
 
-Проверки выполняются в фоне, поэтому их результат не приходит сразу в чат.
-Вердикт сохраняется в состоянии плагина для проекта.
+## Features
 
-**Автоматически.** Как только фоновая проверка завершилась, при следующем
-запросе пользователя хук `UserPromptSubmit` сам подставит готовый вердикт в
-контекст сессии — Claude увидит находки Codex и решит, что с ними делать. Каждый
-вердикт подставляется ровно один раз (помечается `surfacedAt`), повторно он не
-вставляется. Объём подставляемого текста ограничен; длинный вывод обрезается с
-пометкой «truncated».
+| | |
+| --- | --- |
+| 🧭 **Plan review** | `ExitPlanMode` → a devil's-advocate pass before any code is written. |
+| 🐛 **Code review** | `Stop` → a claim-based bug hunt over the uncommitted working tree. |
+| 💬 **Verdict surfacing** | The next prompt gets the verdict + high/medium findings + critical gaps — not the raw report. |
+| 🎭 **Six review profiles** | `generic-code`, `plan-devils-advocate`, `security-review`, `migration-review`, `ai-eval-review`, `gsd-plan-review`. |
+| 📄 **Project config** | Drop a `.codex-autoreview.md` in a repo for project-specific reviewer instructions and a default profile. |
+| 🩺 **`/doctor`** | Self-diagnosis: codex install/login, config, stuck reviews, orphans, log bloat, stale pricing. |
+| ▶️ **`/run`** | On-demand review as a real Claude subagent — visible in Claude's native status with a timer. |
+| 🚦 **Pre-push gate** | A `git push` is warned/blocked when the last review found blockers. |
+| 💵 **Tokens & cost** | `codex exec --json` usage parsed into tokens; a dated, override-able table estimates USD. |
+| 🔌 **Pluggable backends** | `exec-generic`, `exec-review`, and `externalCommand` for an independent second reviewer. |
+| 🧹 **Self-cleaning** | `SessionEnd` reaps orphaned workers, finalizes in-flight reviews, prints a digest, prunes old records. |
+| ⏱️ **Hang-proof** | Hard timeout + process-tree kill + guaranteed terminal state + stuck-job self-healing. |
 
-**Вручную.** Тот же последний вердикт всегда можно посмотреть командой:
+---
+
+## How it works
+
+Reviews run as a **detached background process** and return control
+immediately — Claude is never blocked.
 
 ```
-/codex-autoreview:last
+ExitPlanMode / Stop ─▶ dispatch detached worker ─▶ codex exec (read-only)
+                                                        │
+   UserPromptSubmit ◀── inject verdict ◀── structured JSON result ◀┘
 ```
 
-Можно ограничить вид проверки:
+Codex reviews as a **verifier, not a builder**: it does not write or fix code —
+it proves or disproves claims with deterministic, read-only evidence. The work
+under review is decomposed into atomic claims; anything that can't be backed by
+a file, diff, command output, or test is reported as an `unverified` gap *with
+the oracle that would settle it next time*. The result is a strict JSON object
+(`verdict`, `confidence`, `claims[]`, `findings[]`, `unverified[]`, `usage`);
+the human-readable verdict is rendered from it.
+
+The reviewer's policy is **versioned on disk** — `prompts/_verifier-contract.md`
+(the shared contract), `prompts/profiles/*.md` (the six profiles), and the
+per-kind task blocks — never an ad-hoc string inside a hook.
+
+The hooks are a clean **no-op** when: reviews are off or onboarding is
+incomplete, there is nothing reviewable, the `codex` CLI is missing, or the
+hook gets malformed input.
+
+<details>
+<summary><b>Hang protection — the details</b></summary>
+
+- Every `codex exec` runs under a hard, configurable wall-clock timeout
+  (default 240s). On timeout the whole `codex` process tree is killed and the
+  review is marked `failed`.
+- The background worker flushes a terminal state (`completed`/`failed`) on
+  *every* error path — including being `SIGTERM`/`SIGINT`-killed itself.
+- The dispatch hooks only spawn the worker and exit; they never wait.
+- A review stuck in `queued`/`running` far past its bound is flagged (not shown
+  as healthy) by `/codex-autoreview:last` and the statusline.
+- A review orphaned by a `SIGKILL`/OOM/crash self-heals: it is reconciled to
+  `failed` by `SessionEnd` and on the next dispatch.
+
+</details>
+
+---
+
+## Configuration
 
 ```
-/codex-autoreview:last plan
+/codex-autoreview:config                       # show current settings + codex availability
+/codex-autoreview:config --enable               # turn reviews on for this project
+/codex-autoreview:config --disable              # turn them off
+```
+
+<details>
+<summary><b>Model, reasoning effort & timeout</b></summary>
+
+```
+/codex-autoreview:config --enable --model gpt-5.4-mini --effort high --timeout 180000
+```
+
+- **`--effort`** — `low` · `medium` (default) · `high` · `xhigh`. This is the
+  plugin's *own* default; it is **not** inherited from your global
+  `~/.codex/config.toml`, so a global `xhigh` does not slow every background
+  review. `medium` is responsive but still has enough reasoning budget to trace
+  cross-file logic.
+- **`--model`** — unset by default, inherited from `~/.codex/config.toml`. A
+  hardcoded model can be rejected by ChatGPT-auth accounts, so the plugin does
+  not pin one. (`gpt-5.4-mini` above is only an illustration — use a model your
+  account can access.)
+- **`--timeout`** — hard per-review timeout in ms (default `240000`, range
+  `10000`–`1800000`). On expiry the `codex` process tree is killed and the
+  review is `failed`.
+- **Reset** — pass an empty string: `--model ""`, `--effort ""`, `--timeout ""`.
+
+Invalid `--effort`/`--timeout` values are rejected with a clear error; settings
+are left unchanged.
+
+</details>
+
+<details>
+<summary><b>Review profiles</b></summary>
+
+A profile sets the review's emphasis, evidence bar, finding bar, and output
+caps. All profiles share the verifier contract.
+
+| Profile | Focus |
+| --- | --- |
+| `generic-code` | Correctness of the just-made code change (default for code reviews). |
+| `plan-devils-advocate` | Strongest reasons a plan should not execute as written (default for plan reviews). |
+| `security-review` | Injection, authn/authz, secret exposure, SSRF, unsafe crypto. Higher finding cap; favors false positives. |
+| `migration-review` | Behavior parity, data-loss risk, backward compatibility, rollback path. |
+| `ai-eval-review` | Eval coverage gaps, oracle quality, label leakage, prompt-injection in eval inputs. |
+| `gsd-plan-review` | GSD plan artifacts: phase decomposition, requirement traceability, verification-loop completeness, wave conflicts. |
+
+Selection: built-in default → `.codex-autoreview.md` per-project override →
+`/codex-autoreview:run --profile <name>` per-run override.
+
+</details>
+
+<details>
+<summary><b>Project-local <code>.codex-autoreview.md</code></b></summary>
+
+Drop a `.codex-autoreview.md` at a repository root to give the reviewer
+project-specific instructions and a default profile.
+
+- Discovered from the current directory, then up to the git root — so it works
+  from a subdirectory too.
+- Folded into the review prompt *after* the contract and profile. It **refines**
+  the profile but never relaxes the verifier contract or lowers the evidence bar.
+- An oversized file is truncated so it cannot bloat the prompt.
+
+> **Privacy:** this file is sent to Codex as part of the prompt. Keep it free of
+> secrets, keys, and tokens — treat it as ordinary project notes.
+
+</details>
+
+<details>
+<summary><b>Tokens & cost</b></summary>
+
+`codex exec --json` usage events are parsed into `tokensIn`/`tokensOut`; a
+dated pricing table (`scripts/lib/pricing.mjs`, stamped `PRICING_AS_OF`)
+estimates the USD cost.
+
+- Override per project (`pricing.<modelId>`) or per run (`--price-in` /
+  `--price-out`).
+- An unknown model degrades to an honest "cost unknown" — never a fake `$0` —
+  and never fails the review.
+- `/codex-autoreview:doctor` flags a pricing table older than 120 days.
+
+</details>
+
+---
+
+## Verdicts
+
+A review's first line follows a fixed contract:
+
+- **plan** — `SOUND:` (reasonable to execute) or `CONCERNS:` (address first)
+- **code** — `CLEAN:` (no material bugs) or `ISSUES:` (problems found)
+- **`STALE:`** — the reviewed input changed; the review is out of date
+
+The verdict surfaces **automatically** into the next prompt (once each, marked
+`surfacedAt`) — only the verdict, high/medium findings, and critical unverified
+gaps, not the raw report. A finding you dismiss is not re-surfaced by later
+reviews. You can always replay the full last verdict manually:
+
+```
+/codex-autoreview:last           # most recent
+/codex-autoreview:last plan      # filter by kind
 /codex-autoreview:last code
 ```
 
-Первая строка вердикта всегда соответствует контракту:
+---
 
-- проверка плана: `SOUND: ...` (план разумен) или `CONCERNS: ...` (есть
-  замечания);
-- проверка кода: `CLEAN: ...` (багов не найдено) или `ISSUES: ...` (найдены
-  проблемы).
+## Privacy
 
-Дальше идёт подробный разбор замечаний/находок с указанием файлов и строк.
+Designed privacy-first. What you should know:
 
-Если проверка ещё выполняется (`queued` / `running`), команда сообщит об этом —
-повторите `/codex-autoreview:last` чуть позже. Если проверка «застряла» надолго,
-команда пометит её как `LIKELY STUCK`.
+- **Codex reads your repository files.** To review a change, `codex exec` runs
+  with `--sandbox read-only` and `--cd` at the project root, and inspects the
+  working tree itself (`git diff`, file reads). It is read-only — the plugin and
+  the reviewer never modify, check out, or delete anything in your project.
+- **Don't put secrets where reviews can see them.** Secret files (`.env`, keys)
+  are deny-globbed from the reviewer. But `.codex-autoreview.md` and the plan
+  text *are* sent to Codex in the prompt — keep them free of secrets and
+  credentials.
+- **What's stored in plugin state** (`state.json`, in the plugin's data
+  directory — *not* your repo): project settings, a ring buffer of recent
+  reviews with their structured result (verdict, findings, unverified gaps,
+  tokens/cost), `surfacedAt`/`onboardedAt` markers, dismissed findings, and
+  accumulated review gaps. **The full prompt text is not kept after dispatch** —
+  it is redacted/deleted.
+- **Minimal env allowlist.** No secret environment variables are forwarded to
+  the child `codex`; auth paths are not logged; no keys or cookie-auth are
+  bundled.
+- **`~/.codex` is never touched** — Codex's own config, auth, and history are
+  out of scope for every hook.
 
-## Очистка при завершении сессии
+---
 
-Когда сессия Claude Code завершается или очищается, хук `SessionEnd` подчищает
-**только собственные** временные артефакты плагина:
+## Commands
 
-- убивает «осиротевшие» фоновые процессы `review-worker.mjs`, запущенные именно
-  этой сессией (процессы других сессий не трогаются);
-- переводит незавершённые проверки этой сессии в терминальное состояние
-  `failed`, чтобы ничего не «висело»;
-- подчищает старые записи проверок и их файлы логов, **сохраняя** несколько
-  последних вердиктов — чтобы `/codex-autoreview:last` работал и после очистки.
-
-Хук **никогда** не трогает данные пользователя в `~/.codex` — конфиг,
-авторизация и история Codex вне его компетенции.
-
-## Требования
-
-- **Node.js >= 18.18.0** — уже есть, если установлен Claude Code.
-- **`codex` CLI — устанавливается отдельно.** Плагин его не поставляет и не
-  устанавливает:
-
-  ```
-  npm install -g @openai/codex
-  ```
-
-  После установки войдите в аккаунт (`codex login`), если этого требует ваш
-  провайдер модели. Если `codex` недоступен, хуки просто ничего не делают, а
-  команда `/codex-autoreview:config` это покажет.
-
-## Команды
-
-| Команда | Назначение |
+| Command | Purpose |
 | --- | --- |
-| `/codex-autoreview:config` | Посмотреть или изменить настройки проекта: включение/выключение, модель, effort. |
-| `/codex-autoreview:last` | Показать последний сохранённый вердикт Codex (план или код). |
+| `/codex-autoreview:config` | View or change per-project settings: enable/disable, model, effort, timeout. |
+| `/codex-autoreview:last` | Show the last saved Codex verdict (plan or code). |
+| `/codex-autoreview:run` | Run a review on demand as a real Claude subagent. |
+| `/codex-autoreview:doctor` | Self-diagnosis: codex, config, stuck reviews, orphans, logs, pricing. |
+| `/codex-autoreview:onboard` | Re-run the onboarding flow. |
 
-## Структура плагина
+## Requirements
 
-| Путь | Назначение |
-| --- | --- |
-| `.claude-plugin/plugin.json` | Манифест плагина Claude Code. |
-| `hooks/hooks.json` | Регистрация хуков `PreToolUse`/`ExitPlanMode`, `Stop`, `UserPromptSubmit`, `SessionEnd`. |
-| `scripts/auto-plan-review-hook.mjs` | Хук проверки плана: запускает фоновую проверку «адвокат дьявола». |
-| `scripts/auto-code-review-hook.mjs` | Хук проверки кода: запускает фоновую проверку на баги. |
-| `scripts/surface-verdict-hook.mjs` | Хук `UserPromptSubmit`: подставляет готовый вердикт в контекст сессии. |
-| `scripts/session-end-cleanup-hook.mjs` | Хук `SessionEnd`: чистит процессы и файлы этой сессии. |
-| `scripts/review-worker.mjs` | Отсоединённый фоновый процесс: вызывает `codex exec` с таймаутом и сохраняет вердикт. |
-| `scripts/codex-autoreview.mjs` | CLI за слэш-командами `config` и `last`. |
-| `scripts/statusline.mjs` | Сегмент статусной строки. |
-| `scripts/lib/codex.mjs` | Интеграция с Codex CLI (вызов `codex exec` с таймаутом), резолверы модели/effort/таймаута. |
-| `scripts/lib/auto-review.mjs` | Диспетчер фоновых проверок (запуск отсоединённого процесса). |
-| `scripts/lib/state.mjs` | Состояние проекта: переключатель, модель/effort/таймаут, буфер вердиктов, очистка. |
-| `scripts/lib/git.mjs` | Определение git-репозитория и изменений рабочего дерева. |
-| `scripts/lib/workspace.mjs` | Определение корня рабочего пространства. |
-| `scripts/lib/prompts.mjs` | Загрузка и подстановка шаблонов промптов. |
-| `scripts/lib/process.mjs` | Обёртки над дочерними процессами. |
-| `prompts/auto-plan-review.md` | Шаблон промпта для проверки плана. |
-| `prompts/auto-code-review.md` | Шаблон промпта для проверки кода. |
-| `commands/config.md`, `commands/last.md` | Определения слэш-команд. |
-| `tests/` | Тесты на `node:test`. |
+- **Node.js ≥ 18.18.0** — already present if you have Claude Code.
+- **The `codex` CLI, installed separately** — `npm install -g @openai/codex`,
+  then `codex login` if your provider requires it. Without it the hooks no-op
+  cleanly, and `/codex-autoreview:config` and `/codex-autoreview:doctor` say so.
 
-## Тесты
+## Tests
 
 ```
 npm test
 ```
 
-## Лицензия
+## License
 
-Плагин распространяется под лицензией **Apache-2.0** (см. `LICENSE`).
-
-Часть модулей в `scripts/lib/` встроена (vendored) или адаптирована из проекта
-`codex-plugin-cc` от OpenAI, который также лицензирован под Apache-2.0.
-Атрибуция указана в файле `NOTICE` и в заголовке каждого встроенного файла.
+Apache-2.0 (see `LICENSE`). Some modules under `scripts/lib/` are vendored or
+adapted from OpenAI's `codex-plugin-cc`, also Apache-2.0; attribution is in
+`NOTICE` and in each vendored file's header.
