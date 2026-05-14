@@ -26,7 +26,8 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
  * onboarding marker (`config.onboardedAt`), the accumulated review-gap
  * accumulator (`reviewGaps`), and the per-review anchoring / structured-result
  * fields (`request.reviewedInputHash`, `request.backend`, `review.result`,
- * `review.reviewedInputHash`). All additive — {@link loadState} reads a v1
+ * `review.reviewedInputHash`). Wave 2C additionally added the review-profile
+ * override (`config.profile`). All additive — {@link loadState} reads a v1
  * file unchanged (missing keys fill from {@link defaultState}), so the bump is
  * backward-compatible.
  */
@@ -93,6 +94,10 @@ const LOCK_RETRY_MS = 25;
  *   `"exec-generic"` — today's behavior, the non-breaking migration default.
  * @property {object | null} backendConfig - Backend-specific config (e.g. the
  *   `externalCommand` object for the `external` backend), or null.
+ * @property {string | null} profile - Review profile id override (one of
+ *   `review-schema.mjs`'s `REVIEW_PROFILES`), or null to use the per-kind
+ *   default. Wave 2C's profiles/personas; the CLI validates the enum on write,
+ *   the worker resolves null to a per-kind default.
  * @property {Record<string, { in: number, cachedIn?: number, out: number }>} pricing
  *   Per-model USD-per-1M-token rate overrides (F6) — wins over the hardcoded
  *   table. Empty object by default.
@@ -223,6 +228,8 @@ function defaultState() {
       // F1: reviewer backend. Default reproduces today's behavior exactly.
       backend: "exec-generic",
       backendConfig: null,
+      // Wave 2C: review profile override — null means the per-kind default.
+      profile: null,
       // F6: per-model price overrides (wins over the hardcoded table).
       pricing: {},
       // F3: accept/reject memory — findings the user dismissed.
@@ -420,8 +427,8 @@ export function resolveReviewLogFile(cwd, reviewId) {
  * corrupt.
  *
  * BACKWARD-COMPATIBLE (F3): an older v1 state file has no `backend`/`pricing`/
- * `dismissedFindings`/`onboardedAt`/`reviewGaps` — every missing key is filled
- * from {@link defaultState}, so a v1 file loads cleanly as v2 with the
+ * `profile`/`dismissedFindings`/`onboardedAt`/`reviewGaps` — every missing key
+ * is filled from {@link defaultState}, so a v1 file loads cleanly as v2 with the
  * onboarding marker absent (= not yet onboarded) and today's-behavior defaults.
  *
  * @param {string} cwd
@@ -455,6 +462,10 @@ export function loadState(cwd) {
         backendConfig:
           parsedConfig.backendConfig && typeof parsedConfig.backendConfig === "object"
             ? parsedConfig.backendConfig
+            : null,
+        profile:
+          typeof parsedConfig.profile === "string" && parsedConfig.profile
+            ? parsedConfig.profile
             : null,
         pricing:
           parsedConfig.pricing && typeof parsedConfig.pricing === "object"
