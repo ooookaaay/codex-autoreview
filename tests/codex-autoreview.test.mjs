@@ -41,6 +41,7 @@ import {
 } from "../scripts/lib/codex.mjs";
 import {
   STALE_RUNNING_MS,
+  claimUnsurfacedCompletedReviews,
   resolveStateDir,
   getLatestReview,
   isReviewLikelyStuck,
@@ -993,6 +994,41 @@ test("surface-verdict hook injects a completed verdict exactly once", () => {
   });
   assert.equal(second.status, 0, second.stderr);
   assert.equal(second.stdout, "", "an already-surfaced verdict must not be re-injected");
+});
+
+test("claimUnsurfacedCompletedReviews claims each review exactly once under concurrency", async () => {
+  const { repo } = setupRepo();
+  // 12 completed, unsurfaced verdicts.
+  for (let index = 0; index < 12; index += 1) {
+    upsertReview(repo, {
+      id: `claim-${index}`,
+      kind: "code",
+      status: "completed",
+      verdict: `ISSUES: bug ${index}`,
+      output: `ISSUES: bug ${index}`
+    });
+  }
+  // Fire many concurrent claimers (mirrors concurrent UserPromptSubmit hooks).
+  const claimers = Array.from({ length: 8 }, () =>
+    Promise.resolve().then(() =>
+      claimUnsurfacedCompletedReviews(repo, { sessionId: "s1", limit: 3 })
+    )
+  );
+  const results = await Promise.all(claimers);
+
+  // Every claimed id across all claimers must be unique — no double-surface.
+  const allClaimed = results.flat().map((r) => r.id);
+  assert.equal(
+    new Set(allClaimed).size,
+    allClaimed.length,
+    "the same review must never be claimed by two concurrent callers"
+  );
+  // All 12 are now surfaced; a fresh claim returns nothing.
+  assert.equal(allClaimed.length, 12, "all 12 reviews should have been claimed exactly once");
+  assert.equal(claimUnsurfacedCompletedReviews(repo, { sessionId: "s1" }).length, 0);
+  for (const review of loadState(repo).reviews) {
+    assert.ok(review.surfacedAt, `${review.id} should be stamped surfacedAt`);
+  }
 });
 
 test("surface-verdict hook is session-scoped — never steals another session's verdict", () => {

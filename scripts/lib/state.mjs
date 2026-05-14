@@ -502,14 +502,38 @@ export function isReviewLikelyStuck(review, options = {}) {
 }
 
 /**
- * Completed reviews that carry a verdict but have not yet been surfaced into a
- * Claude session, oldest first. The `UserPromptSubmit` hook injects these.
+ * Whether a review is a completed verdict eligible to be surfaced to
+ * `sessionId` (and has not been surfaced yet).
  *
- * When `sessionId` is given, the result is scoped to that session: a review is
- * eligible only if it was dispatched by this session (`request.sessionId`
- * matches) or carries no session attribution at all. This prevents one Claude
- * session from consuming — and marking surfaced — another session's verdict for
- * the same repo, which would mean the originating session never sees it.
+ * @param {ReviewRecord} review
+ * @param {string | null} sessionId
+ * @returns {boolean}
+ */
+function isSurfaceableFor(review, sessionId) {
+  if (
+    review.status !== "completed" ||
+    typeof review.verdict !== "string" ||
+    !review.verdict.trim() ||
+    review.surfacedAt
+  ) {
+    return false;
+  }
+  if (!sessionId) {
+    return true;
+  }
+  const reviewSession =
+    review.request && typeof review.request === "object"
+      ? review.request.sessionId
+      : undefined;
+  // Eligible for this session if it owns the review, or the review has no
+  // session attribution (then any session may surface it).
+  return !reviewSession || reviewSession === sessionId;
+}
+
+/**
+ * Read-only peek at completed-but-unsurfaced reviews for a session, oldest
+ * first. Does NOT claim them — for the actual injection path use
+ * {@link claimUnsurfacedCompletedReviews}, which is race-free.
  *
  * @param {string} cwd
  * @param {{ sessionId?: string | null }} [options]
@@ -518,56 +542,54 @@ export function isReviewLikelyStuck(review, options = {}) {
 export function getUnsurfacedCompletedReviews(cwd, options = {}) {
   const sessionId = options.sessionId ?? null;
   return listReviews(cwd)
-    .filter((review) => {
-      if (
-        review.status !== "completed" ||
-        typeof review.verdict !== "string" ||
-        !review.verdict.trim() ||
-        review.surfacedAt
-      ) {
-        return false;
-      }
-      if (!sessionId) {
-        return true;
-      }
-      const reviewSession =
-        review.request && typeof review.request === "object"
-          ? review.request.sessionId
-          : undefined;
-      // Eligible for this session if it owns the review, or the review has no
-      // session attribution (then any session may surface it).
-      return !reviewSession || reviewSession === sessionId;
-    })
+    .filter((review) => isSurfaceableFor(review, sessionId))
     .sort((left, right) =>
       String(left.updatedAt ?? "").localeCompare(String(right.updatedAt ?? ""))
     );
 }
 
 /**
- * Mark a set of reviews as surfaced to a Claude session, so they are not
- * re-injected on every later prompt. Stamps `surfacedAt` (and the session id
- * for auditability). A single locked write covers all ids.
+ * Atomically CLAIM up to `limit` completed-but-unsurfaced reviews for a
+ * session: the eligibility test and the `surfacedAt` stamp happen in ONE locked
+ * `updateState` critical section, and only the reviews actually stamped by this
+ * call are returned. This is what makes the "inject each verdict exactly once"
+ * guarantee hold even when two `UserPromptSubmit` hooks run concurrently — a
+ * separate read-then-write (peek + mark) would let both claim the same review.
+ *
+ * Session scoping matches {@link getUnsurfacedCompletedReviews}: a review is
+ * eligible only for the session that dispatched it, or for any session if it
+ * has no session attribution.
  *
  * @param {string} cwd
- * @param {string[]} reviewIds
- * @param {{ sessionId?: string | null }} [options]
+ * @param {{ sessionId?: string | null, limit?: number }} [options]
+ * @returns {ReviewRecord[]} the reviews this call claimed, oldest first
  */
-export function markReviewsSurfaced(cwd, reviewIds, options = {}) {
-  const ids = new Set(reviewIds);
-  if (ids.size === 0) {
-    return;
+export function claimUnsurfacedCompletedReviews(cwd, options = {}) {
+  const sessionId = options.sessionId ?? null;
+  const limit = Math.max(0, options.limit ?? Number.MAX_SAFE_INTEGER);
+  if (limit === 0) {
+    return [];
   }
-  const surfacedAt = nowIso();
+  /** @type {ReviewRecord[]} */
+  let claimed = [];
   updateState(cwd, (state) => {
-    for (const review of state.reviews) {
-      if (ids.has(review.id) && !review.surfacedAt) {
-        review.surfacedAt = surfacedAt;
-        if (options.sessionId) {
-          review.surfacedSessionId = options.sessionId;
-        }
+    const surfacedAt = nowIso();
+    const eligible = state.reviews
+      .filter((review) => isSurfaceableFor(review, sessionId))
+      .sort((left, right) =>
+        String(left.updatedAt ?? "").localeCompare(String(right.updatedAt ?? ""))
+      )
+      .slice(0, limit);
+    for (const review of eligible) {
+      review.surfacedAt = surfacedAt;
+      if (sessionId) {
+        review.surfacedSessionId = sessionId;
       }
     }
+    // Return deep-ish copies so the caller cannot mutate state post-write.
+    claimed = eligible.map((review) => ({ ...review }));
   });
+  return claimed;
 }
 
 /**

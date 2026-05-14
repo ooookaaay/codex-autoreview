@@ -22,11 +22,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import {
-  getConfig,
-  getUnsurfacedCompletedReviews,
-  markReviewsSurfaced
-} from "./lib/state.mjs";
+import { claimUnsurfacedCompletedReviews, getConfig } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 /** Hard cap on the injected context so a huge Codex output cannot bloat the prompt. */
@@ -114,25 +110,21 @@ function main() {
     return;
   }
 
-  // Scope to this session: never consume (and mark surfaced) a verdict that
-  // belongs to a different Claude session running on the same repo.
-  const pending = getUnsurfacedCompletedReviews(workspaceRoot, { sessionId });
-  if (pending.length === 0) {
+  // Atomically CLAIM the oldest-finished few unsurfaced verdicts: the
+  // eligibility check and the `surfacedAt` stamp happen in one locked critical
+  // section, so two concurrent UserPromptSubmit hooks can never both claim the
+  // same review. Scoped to this session — a verdict belonging to a different
+  // Claude session on the same repo is never consumed here. Any verdicts beyond
+  // the per-prompt cap stay unclaimed and are picked up on the following prompt.
+  const toSurface = claimUnsurfacedCompletedReviews(workspaceRoot, {
+    sessionId,
+    limit: MAX_REVIEWS_PER_PROMPT
+  });
+  if (toSurface.length === 0) {
     return;
   }
 
-  // Surface the oldest-finished few; any beyond the cap stay pending and are
-  // picked up on the following prompt.
-  const toSurface = pending.slice(0, MAX_REVIEWS_PER_PROMPT);
   const additionalContext = buildAdditionalContext(toSurface);
-
-  // Mark them surfaced only after we have successfully built the payload, so a
-  // failure here does not silently swallow a verdict.
-  markReviewsSurfaced(
-    workspaceRoot,
-    toSurface.map((review) => review.id),
-    { sessionId }
-  );
 
   process.stdout.write(
     `${JSON.stringify({
