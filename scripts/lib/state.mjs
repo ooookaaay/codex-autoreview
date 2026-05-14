@@ -50,6 +50,21 @@ const LOCK_RETRY_MS = 25;
 export const STALE_RUNNING_MS = 600_000;
 
 /**
+ * The two terminal review statuses. A review in either of these is final: no
+ * later write may resurrect it (e.g. a worker that kept running after the
+ * SessionEnd hook already reconciled its review to `failed`).
+ */
+export const TERMINAL_STATUSES = Object.freeze(["completed", "failed"]);
+
+/**
+ * @param {Pick<ReviewRecord, "status"> | null | undefined} review
+ * @returns {boolean}
+ */
+export function isTerminalStatus(review) {
+  return Boolean(review && TERMINAL_STATUSES.includes(review.status));
+}
+
+/**
  * @typedef {object} ReviewRecord
  * @property {string} id - Unique review/job id.
  * @property {"plan" | "code"} kind - Which hook produced the review.

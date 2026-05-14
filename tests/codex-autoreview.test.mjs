@@ -776,6 +776,32 @@ test("review-worker marks a hung review failed (timeout) — never left running"
   assert.match(review.errorMessage, /timed out after \d+s/);
 });
 
+test("review-worker never resurrects a review already finalized by cleanup", () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir); // would normally produce a CLEAN verdict
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const reviewId = seedQueuedReview(repo, {});
+
+  // Simulate the SessionEnd cleanup having already reconciled this review to
+  // `failed` (worker outlived its session). The worker then starts.
+  upsertReview(repo, {
+    id: reviewId,
+    status: "failed",
+    errorMessage: "Claude session ended before this background review finished."
+  });
+
+  const result = run("node", [WORKER, "--cwd", repo, "--review-id", reviewId], {
+    env: buildEnv(binDir)
+  });
+  // The worker must exit cleanly WITHOUT overwriting the terminal record.
+  assert.equal(result.status, 0, result.stderr);
+  const review = loadState(repo).reviews.find((r) => r.id === reviewId);
+  assert.equal(review.status, "failed", "worker must not resurrect a finalized review");
+  assert.match(review.errorMessage, /session ended/i, "the cleanup's verdict must stand");
+  assert.ok(!review.verdict, "worker must not attach a verdict to a finalized review");
+});
+
 test("review-worker reaches a terminal state when the codex CLI is absent", () => {
   const repo = makeTempDir();
   initGitRepo(repo);

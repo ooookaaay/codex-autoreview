@@ -32,9 +32,10 @@ import {
 } from "./lib/codex.mjs";
 import {
   ensureStateDir,
+  isTerminalStatus,
   listReviews,
   resolveReviewsDir,
-  upsertReview
+  updateReviewIf
 } from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -132,6 +133,12 @@ const terminalState = {
  * once. Every exit path in this worker goes through here, which is what
  * guarantees a review is never abandoned in `running`.
  *
+ * COMPARE-AND-SET: the write is conditional on the review NOT already being
+ * terminal. If the SessionEnd cleanup hook already reconciled this review to
+ * `failed` (because the worker outlived its session), this worker must not
+ * resurrect it with a `completed`/`failed` of its own — the cleanup's verdict
+ * stands. The whole check-and-write runs in one locked critical section.
+ *
  * @param {"completed" | "failed"} status
  * @param {Partial<import("./lib/state.mjs").ReviewRecord>} [patch]
  */
@@ -141,11 +148,12 @@ function settleTerminal(status, patch = {}) {
   }
   terminalState.settled = true;
   try {
-    upsertReview(terminalState.workspaceRoot, {
-      id: terminalState.reviewId,
-      status,
-      ...patch
-    });
+    updateReviewIf(
+      terminalState.workspaceRoot,
+      terminalState.reviewId,
+      (review) => !isTerminalStatus(review),
+      { status, ...patch }
+    );
   } catch (error) {
     // The state write itself failed — there is nothing more we can do to
     // persist the outcome, but the worker must still exit. Surface it on
@@ -211,9 +219,19 @@ async function main() {
     return;
   }
 
-  // From here on the review record exists, so every exit path must leave it in
-  // a terminal state. Register it with the terminal-state machinery.
   const logFile = review.logFile || path.join(resolveReviewsDir(workspaceRoot), `${reviewId}.log`);
+
+  // If the review is ALREADY terminal, a SessionEnd cleanup (or another actor)
+  // has finished it — this worker must not resurrect it. Exit without
+  // registering it with the terminal-state machinery, so no later write fires.
+  if (isTerminalStatus(review)) {
+    appendLog(logFile, `Review is already ${review.status}; worker exiting without claiming it.`);
+    return;
+  }
+
+  // From here on the review record exists and is non-terminal, so every exit
+  // path must leave it in a terminal state. Register it with the
+  // terminal-state machinery.
   terminalState.workspaceRoot = workspaceRoot;
   terminalState.reviewId = reviewId;
   terminalState.logFile = logFile;
@@ -235,7 +253,22 @@ async function main() {
     logFile,
     `Starting ${review.kind} review with model=${request.model} effort=${request.effort} timeoutMs=${timeoutMs}.`
   );
-  upsertReview(workspaceRoot, { id: reviewId, status: "running" });
+  // Claim the review as `running` only if it has NOT been reconciled to a
+  // terminal state in the meantime (compare-and-set). If the claim is rejected,
+  // a cleanup already finished this review — abort without running codex.
+  const claim = updateReviewIf(
+    workspaceRoot,
+    reviewId,
+    (current) => !isTerminalStatus(current),
+    { status: "running" }
+  );
+  if (!claim.applied) {
+    appendLog(logFile, "Review was finalized before this worker could claim it; aborting.");
+    // Mark settled so the finally-backstop does not try to fail it — the
+    // existing terminal state is authoritative.
+    terminalState.settled = true;
+    return;
+  }
 
   const availability = getCodexAvailability(request.cwd ?? cwd);
   if (!availability.available) {
