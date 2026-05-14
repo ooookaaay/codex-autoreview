@@ -366,6 +366,32 @@ test("run --no-wait dispatches a manual code review and returns immediately", ()
   assert.equal(review.kind, "code");
 });
 
+test("run code --note threads the note into the dispatched review's payload", () => {
+  // Regression (audit Finding 1): `--note` text used to be passed as a `prompt`
+  // param that `dispatchBackgroundReview` silently dropped — the note never
+  // reached the review. It must now ride through as `claudeResponseBlock`.
+  const { repo, binDir } = setupRepo();
+  fs.writeFileSync(path.join(repo, "change.txt"), "dirty content\n");
+  const note = "focus on the retry loop in change.txt";
+  const result = run(
+    "node",
+    [CLI, "run", "code", "--no-wait", "--note", note, "--cwd", repo, "--json"],
+    { env: buildEnv(binDir) }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ran, true);
+  assert.ok(payload.reviewId);
+  const review = loadState(repo).reviews.find((r) => r.id === payload.reviewId);
+  assert.ok(review, "the review record was persisted");
+  assert.ok(review.request, "the review carries its request payload");
+  assert.match(
+    String(review.request.claudeResponseBlock ?? ""),
+    new RegExp(note.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    "the --note context must be threaded into claudeResponseBlock"
+  );
+});
+
 test("run waits for the verdict and prints it (fake codex)", async () => {
   const { repo, binDir } = setupRepo();
   fs.writeFileSync(path.join(repo, "change.txt"), "dirty content\n");

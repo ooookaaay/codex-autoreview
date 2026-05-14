@@ -95,13 +95,28 @@ plugin is now ready for public distribution.
 
 ### Docs & metadata
 
-- README rewritten (Russian) covering every new surface, the privacy model
-  (what is stored in state, that Codex reads repo files, exclude secrets), and
-  the separate `codex` CLI prerequisite.
+- README rewritten as a complete setup manual: the separate `codex` CLI
+  prerequisite, plugin install via `claude plugin marketplace add` + `install`,
+  per-project enable/onboard, the optional statusline, update/uninstall, a
+  troubleshooting table, and the privacy model (what is stored in state, that
+  Codex reads repo files, exclude secrets).
+- `.claude-plugin/marketplace.json` makes the repo a self-contained
+  single-plugin marketplace (`source: "."`) — installable with one command.
 - `plugin.json` gains public-distribution metadata (`repository`, `homepage`,
   `keywords`, `$schema`, `version` bumped to `0.3.0`). The statusline is
   registered through `settings.json`, not the manifest — Claude Code does not
   honor a `statusLine` key from a plugin manifest.
+
+### Audit & hardening
+
+- **Pre-publication code audit** — a full pass over `scripts/` resolved one
+  HIGH and several minor findings: `/codex-autoreview:run --note` now actually
+  threads its context into the review (it was silently dropped); dead code
+  (`buildManualReviewPrompt`, the vestigial `maxAgeMs` prune path) removed; the
+  `ReviewRecord` typedef and a misleading exit-status fallback corrected.
+- **Leak-proof test fixtures** — the fake hanging-codex test fixtures now
+  self-terminate the moment they are orphaned, so a `SIGKILL`-based test can
+  never leave a stray process behind. Full suite: 233 tests, deterministic.
 
 ## 0.2.0
 

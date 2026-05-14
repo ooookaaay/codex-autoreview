@@ -38,7 +38,6 @@ import {
 } from "./lib/codex.mjs";
 import { dispatchBackgroundReview } from "./lib/auto-review.mjs";
 import { getWorkingTreeState } from "./lib/git.mjs";
-import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { PRICING_AS_OF, normalizeRateOverride } from "./lib/pricing.mjs";
 import { BACKEND_IDS, isKnownBackend, DEFAULT_BACKEND_ID } from "./lib/reviewers/index.mjs";
 import { validateExternalConfig } from "./lib/reviewers/external.mjs";
@@ -58,7 +57,6 @@ import {
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 
 /**
  * Minimal flag parser: `--key value` for value flags, `--key` for booleans.
@@ -444,33 +442,6 @@ function handleLast(argv) {
 }
 
 /**
- * Build the review prompt for a manual `run`. Mirrors what the auto hooks do
- * (`loadPromptTemplate` + `interpolateTemplate`) so a manual review uses the
- * SAME versioned prompt contract as an automatic one — no ad-hoc prompts.
- *
- * @param {"plan" | "code"} kind
- * @param {{ planText?: string, note?: string }} extras
- * @returns {string}
- */
-function buildManualReviewPrompt(kind, extras = {}) {
-  if (kind === "plan") {
-    const template = loadPromptTemplate(ROOT_DIR, "auto-plan-review");
-    return interpolateTemplate(template, {
-      PLAN_BLOCK: String(extras.planText ?? "").trim() || "(no plan text supplied)",
-      REVIEWED_INPUT_HASH: ""
-    });
-  }
-  const template = loadPromptTemplate(ROOT_DIR, "auto-code-review");
-  const note = String(extras.note ?? "").trim();
-  return interpolateTemplate(template, {
-    CLAUDE_RESPONSE_BLOCK: note
-      ? ["Context supplied with the manual review request:", note].join("\n")
-      : "",
-    REVIEWED_INPUT_HASH: ""
-  });
-}
-
-/**
  * `run` — dispatch a manual on-demand review, then POLL until it reaches a
  * terminal state and print the verdict.
  *
@@ -535,16 +506,25 @@ async function handleRun(argv) {
 
   const planText =
     typeof options.plan === "string" && options.plan ? options.plan : positionals.slice(1).join(" ");
-  const prompt = buildManualReviewPrompt(kind, {
-    planText,
-    note: typeof options.note === "string" ? options.note : ""
-  });
+  // The runtime payload MUST go through the params `dispatchBackgroundReview`
+  // actually reads — it has no `prompt` param, and the worker re-assembles the
+  // versioned prompt itself. For a code review the `--note` context is the
+  // builder's-message equivalent (`claudeResponseBlock` →
+  // `{{CLAUDE_RESPONSE_BLOCK}}`); for a plan review `planText` carries it.
+  const note = typeof options.note === "string" ? options.note.trim() : "";
 
   const dispatch = dispatchBackgroundReview({
     cwd: workspaceRoot,
     kind,
-    prompt,
     ...(kind === "plan" && planText ? { planText } : {}),
+    ...(kind === "code" && note
+      ? {
+          claudeResponseBlock: [
+            "Context supplied with the manual review request:",
+            note
+          ].join("\n")
+        }
+      : {}),
     config: {
       model: config.model,
       effort: config.effort,

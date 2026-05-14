@@ -186,6 +186,8 @@ export function isTerminalStatus(review) {
  * @property {number | null} [pid] - Detached worker pid, when known.
  * @property {string | null} [surfacedAt] - ISO timestamp when the completed
  *   verdict was injected into a Claude session, or absent/null if not yet.
+ * @property {string} [surfacedSessionId] - The Claude session id that claimed
+ *   and surfaced this review (stamped alongside `surfacedAt`).
  * @property {import("./review-schema.mjs").ReviewResult | null} [result] - The
  *   full F2 claim-based structured review object, when the backend produced
  *   one. The text fields above are rendered from this. (F2/F3)
@@ -850,19 +852,18 @@ export function claimUnsurfacedCompletedReviews(cwd, options = {}) {
  *     cannot have a live worker (the worker's own hard timeout is far shorter),
  *     so its worker was SIGKILL'd / OOM-killed / crashed without flushing a
  *     terminal state. This is the canonical recovery path for that case.
- *   - reviews are pruned by age and count, but the most recent terminal review
- *     is always kept so `/codex-autoreview:last` still works after a clear.
+ *   - terminal reviews are pruned by count — the most recent `keepRecent` are
+ *     kept so `/codex-autoreview:last` still works after a clear.
  *
  * Never touches `~/.codex` or anything outside the plugin's own state file.
  *
  * @param {string} cwd
- * @param {{ sessionId?: string | null, now?: number, maxAgeMs?: number, keepRecent?: number, staleMs?: number }} [options]
+ * @param {{ sessionId?: string | null, now?: number, keepRecent?: number, staleMs?: number }} [options]
  * @returns {{ reconciled: number, healed: number, pruned: number, kept: number, prunedIds: string[] }}
  */
 export function reconcileAndPruneReviews(cwd, options = {}) {
   const sessionId = options.sessionId ?? null;
   const now = options.now ?? Date.now();
-  const maxAgeMs = options.maxAgeMs ?? 24 * 60 * 60 * 1000;
   const keepRecent = Math.max(1, options.keepRecent ?? 5);
   // staleMs is intentionally NOT defaulted: when unset, isReviewLikelyStuck
   // computes a PER-REVIEW bound from each review's own configured timeout, so a
@@ -907,7 +908,7 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
       }
     }
 
-    // 2. Prune by age + count. CRITICAL invariants:
+    // 2. Prune by count. CRITICAL invariants:
     //    - only TERMINAL reviews are ever eligible. A `queued`/`running` review
     //      is always kept — it may belong to ANOTHER active session whose
     //      worker is still running; deleting its record would let that worker
@@ -930,14 +931,12 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
         kept += 1;
         continue;
       }
-      // Among terminal reviews: keep the most recent `keepRecent` outright; the
-      // rest are pruned if they are too old or over the count budget.
+      // Among terminal reviews: keep the most recent `keepRecent`, prune the
+      // rest. Count is the single retention bound — `keepRecent` counted over
+      // terminal reviews only (the invariant above).
       const terminalIndex = terminalSeen;
       terminalSeen += 1;
-      const updatedAt = Date.parse(String(review.updatedAt ?? ""));
-      const tooOld = Number.isFinite(updatedAt) && now - updatedAt > maxAgeMs;
-      const overKeepBudget = terminalIndex >= keepRecent;
-      if (terminalIndex >= keepRecent && (tooOld || overKeepBudget)) {
+      if (terminalIndex >= keepRecent) {
         prunedIds.push(review.id);
       } else {
         survivors.push(review);

@@ -380,7 +380,7 @@ export function spawnWithTimeout(params) {
         }
       }
       resolve({
-        status: status ?? (signal ? 1 : 0),
+        status,
         stdout: capCapture(stdout),
         stderr: capCapture(stderr),
         signal: signal ?? null,
@@ -394,8 +394,11 @@ export function spawnWithTimeout(params) {
       spawnError = error instanceof Error ? error : new Error(String(error));
       finish(1, null);
     });
+    // A signal-killed child exits `close` with `code === null` — map that to a
+    // non-zero status here (the one place that sees `signal`), so `finish`
+    // always receives a concrete numeric status.
     child.on("close", (code, signal) => {
-      finish(code ?? 0, signal ?? null);
+      finish(code ?? (signal ? 1 : 0), signal ?? null);
     });
 
     try {

@@ -111,6 +111,15 @@ process.exit(0);
  * timeout and process-tree kill. The grandchild writes its pid to `pidFile` so
  * a test can assert the whole tree was reaped.
  *
+ * SELF-REAPING: both the fake codex and its grandchild block forever *but*
+ * self-terminate the instant they are orphaned (their `ppid` changes). The
+ * worker's hard timeout / process-tree kill is still what ends them on the
+ * normal paths — but if a test deliberately `SIGKILL`s the worker (bypassing
+ * the worker's own reaper, which is the only catchable-signal path that reaps
+ * codex), this fake-codex tree still cannot leak: the fake codex sees its
+ * worker parent vanish and exits, then the grandchild sees the fake codex
+ * vanish and exits. No per-test cleanup hook required.
+ *
  * @param {string} binDir
  * @param {{ pidFile?: string }} [options]
  */
@@ -128,13 +137,20 @@ if (argv[0] === "--version") {
 // codex exec: spawn a grandchild that sleeps "forever", record its pid, and
 // block on it. Never write the --output-last-message file.
 try { fs.readFileSync(0, "utf8"); } catch {}
-const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], {
-  stdio: "ignore"
-});
+// The grandchild hangs forever too — but self-exits once orphaned (its ppid
+// changes when this fake codex exits), so it can never outlive the tree.
+const grandchild = spawn(
+  process.execPath,
+  ["-e", "const p=process.ppid;setInterval(()=>{if(process.ppid!==p)process.exit(0)},200)"],
+  { stdio: "ignore" }
+);
 try { fs.writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid), "utf8"); } catch {}
 process.stderr.write("OpenAI Codex (fake, hanging)\\n");
-// Block this process too, so the whole tree must be killed by the timeout.
-setInterval(() => {}, 1e9);
+// Block this process too — the worker's timeout / process-tree kill is what
+// ends it on the normal paths. But self-exit if orphaned (ppid changes), so a
+// SIGKILL'd worker that bypassed its own reaper still cannot leak this tree.
+const __ppid0 = process.ppid;
+setInterval(() => { if (process.ppid !== __ppid0) process.exit(0); }, 200);
 `;
   fs.writeFileSync(codexPath, script, "utf8");
   fs.chmodSync(codexPath, 0o755);
