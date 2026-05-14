@@ -2,3 +2,12 @@ node_modules/
 *.log
 .DS_Store
 docs/
+
+# Secrets — never commit env files (the plugin's own threat model)
+.env
+.env.*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
