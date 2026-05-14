@@ -6,9 +6,19 @@ allowed-tools: Bash(node:*)
 
 The user invoked `/codex-autoreview:onboard`. Guide them through onboarding this project.
 
-First, read the current onboarding state and checklist:
+Arguments received: `$ARGUMENTS`
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" onboard $ARGUMENTS`
+First, read the current onboarding state and checklist by running the command
+yourself with the **Bash tool**. The only valid argument is an optional
+`--complete` flag — never splice the raw `$ARGUMENTS` string into the command
+line.
+
+Invoke:
+
+`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" onboard [--complete]`
+
+If the user passed `--complete`, append exactly that one literal flag as a
+separate explicit argument. Otherwise run `onboard` with no extra argument.
 
 Then walk the user through any checklist item that is not yet done (`[ ]`). The required steps are the first two; the rest are optional but worth offering:
 
@@ -24,7 +34,7 @@ Then walk the user through any checklist item that is not yet done (`[ ]`). The 
 
 Once the required steps are done (Codex installed + logged in, review enabled), finish onboarding by running:
 
-!`echo "When the user confirms setup is complete, run: /codex-autoreview:onboard --complete"`
+When the user confirms setup is complete, run `/codex-autoreview:onboard --complete` — which invokes `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" onboard --complete` via the Bash tool.
 
 When you run `onboard --complete`, the project is marked onboarded and the automatic review hooks become active. Onboarding is sticky — re-running this command just re-walks the checklist; it never un-onboards the project.
 

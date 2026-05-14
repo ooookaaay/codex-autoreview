@@ -5,7 +5,17 @@ disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" doctor $ARGUMENTS`
+The user invoked `/codex-autoreview:doctor`.
+
+Arguments received: `$ARGUMENTS`
+
+Run the diagnostics yourself with the **Bash tool**. `doctor` takes no
+arguments — ignore anything in `$ARGUMENTS` and never splice it into the
+command line.
+
+Invoke exactly:
+
+`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" doctor`
 
 Present the full diagnostic report to the user. Do not summarize it — every check line and every suggested action matters.
 

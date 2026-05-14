@@ -4,7 +4,22 @@ argument-hint: '[--enable|--disable] [--model <model>] [--effort <low|medium|hig
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" config $ARGUMENTS`
+The user invoked `/codex-autoreview:config`.
+
+Arguments received: `$ARGUMENTS`
+
+Run the config command yourself with the **Bash tool**. Parse the arguments
+above into discrete, validated flags and pass each one as a separate explicit
+argument — never splice the raw `$ARGUMENTS` string into the command line.
+
+Invoke:
+
+`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" config <parsed flags…>`
+
+For example, if the user passed `--enable --effort high`, run the CLI with the
+two separate arguments `--enable` and `--effort` `high`. With no arguments, run
+`config` with no extra arguments. Reject anything that is not a recognized flag
+from the `argument-hint` rather than passing it through.
 
 Present the full command output to the user.
 

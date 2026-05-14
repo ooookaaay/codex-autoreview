@@ -5,7 +5,21 @@ disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" last $ARGUMENTS`
+The user invoked `/codex-autoreview:last`.
+
+Arguments received: `$ARGUMENTS`
+
+Run the command yourself with the **Bash tool**. The only valid argument is an
+optional `plan` or `code` review-kind selector — never splice the raw
+`$ARGUMENTS` string into the command line.
+
+Invoke:
+
+`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-autoreview.mjs" last [plan|code]`
+
+If the user passed `plan` or `code`, append exactly that one literal word as a
+separate explicit argument. If they passed anything else, run `last` with no
+extra argument (it then shows the most recent review of either kind).
 
 Present the full command output to the user. Do not summarize or condense it. Preserve all details including:
 - The review id, kind, status, and timestamp
