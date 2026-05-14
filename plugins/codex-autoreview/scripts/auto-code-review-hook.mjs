@@ -113,8 +113,11 @@ function main() {
     return;
   }
 
+  // Codex availability is only a precondition when the configured backend
+  // actually needs the Codex CLI. An `external` backend reviews without it, so
+  // gating on Codex there would silently skip every automatic review (F-03).
   const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
+  if (!availability.available && config.backend !== "external") {
     const detail = availability.detail ? ` ${availability.detail}.` : "";
     logNote(
       `codex-autoreview: Codex CLI is not available for the code review.${detail} Install it with \`npm install -g @openai/codex\`.`
