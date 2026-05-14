@@ -44,6 +44,7 @@ import {
   claimUnsurfacedCompletedReviews,
   resolveStateDir,
   getLatestReview,
+  healStuckReviews,
   isReviewLikelyStuck,
   loadState,
   updateReviewIf,
@@ -887,6 +888,37 @@ test("review-worker, killed by SIGTERM, flushes 'failed' AND reaps the codex tre
   assert.ok(codexReaped, `codex grandchild ${grandchildPid} must be reaped, not orphaned`);
 });
 
+test("healStuckReviews self-heals a SIGKILL-orphaned 'running' review to failed", () => {
+  const { repo } = setupRepo();
+  // A fresh running review (worker presumably alive) must be left alone.
+  upsertReview(repo, { id: "fresh-run", kind: "code", status: "running" });
+  // A running review last touched > STALE_RUNNING_MS ago — its worker is dead
+  // (a live worker self-terminates at its 240s hard timeout, far under 10min).
+  upsertReview(repo, { id: "stuck-run", kind: "code", status: "running" });
+  const st = loadState(repo);
+  st.reviews.find((r) => r.id === "stuck-run").updatedAt = new Date(
+    Date.now() - STALE_RUNNING_MS - 120_000
+  ).toISOString();
+  fs.writeFileSync(
+    path.join(resolveStateDir(repo), "state.json"),
+    `${JSON.stringify(st, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = healStuckReviews(repo);
+  assert.equal(result.healed, 1, "exactly the stale review is healed");
+
+  const reviews = loadState(repo).reviews;
+  const stuck = reviews.find((r) => r.id === "stuck-run");
+  const fresh = reviews.find((r) => r.id === "fresh-run");
+  assert.equal(stuck.status, "failed", "the stale review is reconciled to failed");
+  assert.match(stuck.errorMessage, /stale running review/i);
+  assert.equal(fresh.status, "running", "a fresh running review is NOT touched");
+
+  // Idempotent: a second sweep heals nothing.
+  assert.equal(healStuckReviews(repo).healed, 0);
+});
+
 test("isReviewLikelyStuck flags non-terminal reviews past the stale bound", () => {
   const fresh = { status: "running", updatedAt: new Date().toISOString() };
   assert.equal(isReviewLikelyStuck(fresh), false);
@@ -1207,22 +1239,26 @@ test("session-end hook NEVER prunes another active session's running review or f
   const reviewsDir = path.join(resolveStateDir(repo), "reviews");
   fs.mkdirSync(reviewsDir, { recursive: true });
 
-  // Another session (session-B) has an OLD queued review still in flight, with
-  // its log + output files. Even though it is old and over any keep budget, a
-  // session-A cleanup must NOT prune it — its worker may still be running.
+  // Another session (session-B) has a FRESH running review still in flight,
+  // with its log + output files — its worker is genuinely alive. A session-A
+  // cleanup must NOT prune it, NOT reconcile it, and NOT touch its files.
   upsertReview(repo, {
     id: "B-inflight",
     kind: "plan",
     status: "running",
     request: { cwd: repo, prompt: "x", sessionId: "session-B" }
   });
-  // Pad with many old terminal reviews so the keep-budget pressure is real.
+  // Pad with many OLD terminal reviews so the keep-budget pressure is real.
   for (let index = 0; index < 8; index += 1) {
     upsertReview(repo, { id: `pad-${index}`, kind: "code", status: "completed", verdict: "CLEAN: ok" });
   }
   const aged = loadState(repo);
   for (const review of aged.reviews) {
-    review.updatedAt = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
+    // Backdate only the terminal pad reviews; keep B-inflight fresh so it is
+    // not (correctly) self-healed as stale — this test is about pruning safety.
+    if (review.id !== "B-inflight") {
+      review.updatedAt = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
+    }
   }
   fs.writeFileSync(
     path.join(resolveStateDir(repo), "state.json"),
@@ -1252,6 +1288,53 @@ test("session-end hook NEVER prunes another active session's running review or f
   assert.ok(
     fs.existsSync(path.join(reviewsDir, "B-inflight.output.txt")),
     "another session's review output must NOT be deleted"
+  );
+});
+
+test("session-end hook self-heals a stuck review from ANOTHER session", () => {
+  const { repo, binDir } = setupRepo();
+  // A stuck running review owned by session-X (its worker was SIGKILL'd).
+  upsertReview(repo, {
+    id: "X-stuck",
+    kind: "code",
+    status: "running",
+    request: { cwd: repo, prompt: "x", sessionId: "session-X" }
+  });
+  // A genuinely fresh running review owned by session-Y — must NOT be healed.
+  upsertReview(repo, {
+    id: "Y-fresh",
+    kind: "plan",
+    status: "running",
+    request: { cwd: repo, prompt: "y", sessionId: "session-Y" }
+  });
+  const st = loadState(repo);
+  st.reviews.find((r) => r.id === "X-stuck").updatedAt = new Date(
+    Date.now() - STALE_RUNNING_MS - 300_000
+  ).toISOString();
+  fs.writeFileSync(
+    path.join(resolveStateDir(repo), "state.json"),
+    `${JSON.stringify(st, null, 2)}\n`,
+    "utf8"
+  );
+
+  // A SessionEnd for an unrelated third session must still heal X-stuck.
+  const result = run("node", [SESSION_END_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "session-Z" }),
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /healed 1 stuck review/i);
+
+  const reviews = loadState(repo).reviews;
+  assert.equal(
+    reviews.find((r) => r.id === "X-stuck").status,
+    "failed",
+    "a stuck review from any session is self-healed"
+  );
+  assert.equal(
+    reviews.find((r) => r.id === "Y-fresh").status,
+    "running",
+    "a genuinely fresh review is left running"
   );
 });
 

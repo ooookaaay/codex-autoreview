@@ -24,6 +24,7 @@ import {
 } from "./codex.mjs";
 import {
   generateReviewId,
+  healStuckReviews,
   resolveReviewLogFile,
   updateReviewIf,
   upsertReview
@@ -60,6 +61,17 @@ export function dispatchBackgroundReview(params) {
   const sessionId = params.sessionId ?? process.env[SESSION_ID_ENV] ?? null;
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+
+  // Opportunistic self-heal: before dispatching a new review, reconcile any
+  // likely-stuck review (a previous worker SIGKILL'd / OOM-killed before it
+  // could flush a terminal state) to `failed`. Cheap no-op when nothing is
+  // stuck — keeps state honest even on projects where SessionEnd never fires.
+  try {
+    healStuckReviews(workspaceRoot);
+  } catch {
+    // Self-heal is best-effort — never let it block a dispatch.
+  }
+
   const model = resolveReviewModel(config);
   const effort = resolveReviewEffort(config);
   const timeoutMs = resolveReviewTimeoutMs(config);

@@ -596,40 +596,62 @@ export function claimUnsurfacedCompletedReviews(cwd, options = {}) {
  * Session-end cleanup of the plugin's OWN state, in one locked pass:
  *   - in-flight reviews (`queued`/`running`) belonging to `sessionId` are
  *     reconciled to `failed` ("session ended"), so nothing is left dangling;
+ *   - any LIKELY-STUCK in-flight review — from any session — is self-healed to
+ *     `failed`. A review still `queued`/`running` past {@link STALE_RUNNING_MS}
+ *     cannot have a live worker (the worker's own hard timeout is far shorter),
+ *     so its worker was SIGKILL'd / OOM-killed / crashed without flushing a
+ *     terminal state. This is the canonical recovery path for that case.
  *   - reviews are pruned by age and count, but the most recent terminal review
  *     is always kept so `/codex-autoreview:last` still works after a clear.
  *
  * Never touches `~/.codex` or anything outside the plugin's own state file.
  *
  * @param {string} cwd
- * @param {{ sessionId?: string | null, now?: number, maxAgeMs?: number, keepRecent?: number }} [options]
- * @returns {{ reconciled: number, pruned: number, kept: number, prunedIds: string[] }}
+ * @param {{ sessionId?: string | null, now?: number, maxAgeMs?: number, keepRecent?: number, staleMs?: number }} [options]
+ * @returns {{ reconciled: number, healed: number, pruned: number, kept: number, prunedIds: string[] }}
  */
 export function reconcileAndPruneReviews(cwd, options = {}) {
   const sessionId = options.sessionId ?? null;
   const now = options.now ?? Date.now();
   const maxAgeMs = options.maxAgeMs ?? 24 * 60 * 60 * 1000;
   const keepRecent = Math.max(1, options.keepRecent ?? 5);
+  const staleMs = options.staleMs ?? STALE_RUNNING_MS;
   let reconciled = 0;
+  let healed = 0;
   let kept = 0;
   /** @type {string[]} */
   const prunedIds = [];
 
   updateState(cwd, (state) => {
-    // 1. Reconcile this session's still-in-flight reviews to a terminal state.
+    // 1. Reconcile in-flight reviews to a terminal state:
+    //    (a) this session's reviews — its session is ending; and
+    //    (b) ANY likely-stuck review, regardless of session — its worker is
+    //        certainly dead (SIGKILL/OOM/crash) since it outlived the worker's
+    //        own hard timeout by a wide margin.
     for (const review of state.reviews) {
+      if (review.status !== "queued" && review.status !== "running") {
+        continue;
+      }
       const belongsToSession =
         sessionId &&
         review.request &&
         typeof review.request === "object" &&
         review.request.sessionId === sessionId;
-      if (belongsToSession && (review.status === "queued" || review.status === "running")) {
+      const stuck = isReviewLikelyStuck(review, { now, staleMs });
+      if (belongsToSession) {
         review.status = "failed";
         review.errorMessage =
           review.errorMessage ||
           "Claude session ended before this background review finished.";
         review.updatedAt = nowIso();
         reconciled += 1;
+      } else if (stuck) {
+        review.status = "failed";
+        review.errorMessage =
+          review.errorMessage ||
+          "Stale running review — its background worker was terminated without flushing a result.";
+        review.updatedAt = nowIso();
+        healed += 1;
       }
     }
 
@@ -661,5 +683,47 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
     state.reviews = survivors;
   });
 
-  return { reconciled, pruned: prunedIds.length, kept, prunedIds };
+  return { reconciled, healed, pruned: prunedIds.length, kept, prunedIds };
+}
+
+/**
+ * Opportunistic, idempotent self-heal sweep: reconcile any LIKELY-STUCK
+ * in-flight review to `failed`, without pruning anything. This is the cheap
+ * entry-point version of {@link reconcileAndPruneReviews}'s healing step —
+ * called from the hook dispatch path so a stuck review is recovered even on
+ * projects/sessions where `SessionEnd` never fires. No-op when nothing is
+ * stuck (the common case), so it is safe to call on every dispatch.
+ *
+ * @param {string} cwd
+ * @param {{ now?: number, staleMs?: number }} [options]
+ * @returns {{ healed: number }}
+ */
+export function healStuckReviews(cwd, options = {}) {
+  const now = options.now ?? Date.now();
+  const staleMs = options.staleMs ?? STALE_RUNNING_MS;
+  let healed = 0;
+  // Cheap pre-check without the lock: only take the write lock if something
+  // actually looks stuck.
+  const anyStuck = listReviews(cwd).some((review) =>
+    isReviewLikelyStuck(review, { now, staleMs })
+  );
+  if (!anyStuck) {
+    return { healed: 0 };
+  }
+  updateState(cwd, (state) => {
+    for (const review of state.reviews) {
+      if (
+        (review.status === "queued" || review.status === "running") &&
+        isReviewLikelyStuck(review, { now, staleMs })
+      ) {
+        review.status = "failed";
+        review.errorMessage =
+          review.errorMessage ||
+          "Stale running review — its background worker was terminated without flushing a result.";
+        review.updatedAt = nowIso();
+        healed += 1;
+      }
+    }
+  });
+  return { healed };
 }

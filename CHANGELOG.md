@@ -21,6 +21,11 @@ Resilience, speed, and session integration.
 - **Stale-job visibility.** `/codex-autoreview:last` flags a review stuck in
   `queued`/`running` far past a reasonable bound as `LIKELY STUCK` instead of
   implying it is healthily in progress.
+- **Stuck-job self-healing.** A review left `running` by a `SIGKILL`'d / OOM-
+  killed / crashed worker (the one path that bypasses the terminal-state
+  guarantee) is now auto-reconciled to `failed` — both by the `SessionEnd` hook
+  (for reviews from any session) and opportunistically on the next review
+  dispatch — so a stuck review never lingers forever.
 - **Auto-surfaced verdicts.** A new `UserPromptSubmit` hook injects any finished
   Codex verdict into the session context (once each), so Claude sees the
   findings inline and decides whether to act on them — no manual command needed.

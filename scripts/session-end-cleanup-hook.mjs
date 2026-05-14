@@ -220,10 +220,12 @@ function main() {
 
   // 2. Reconcile this session's in-flight reviews to terminal + prune old ones.
   //    Pruning only ever removes TERMINAL reviews; another active session's
-  //    queued/running review is always kept.
-  const { reconciled, pruned, kept, prunedIds } = reconcileAndPruneReviews(workspaceRoot, {
-    sessionId
-  });
+  //    queued/running review is always kept. It also self-heals any
+  //    likely-stuck review (a SIGKILL'd/crashed worker) from any session.
+  const { reconciled, healed, pruned, kept, prunedIds } = reconcileAndPruneReviews(
+    workspaceRoot,
+    { sessionId }
+  );
 
   // 3. Drop log/output files ONLY for the reviews that were explicitly pruned
   //    above — never for "anything not in current state", which would clobber
@@ -232,8 +234,8 @@ function main() {
 
   logNote(
     `codex-autoreview: session cleanup — killed ${killed} worker(s), ` +
-      `reconciled ${reconciled} in-flight review(s), pruned ${pruned} old record(s) ` +
-      `(kept ${kept}), removed ${filesRemoved} stale file(s).`
+      `reconciled ${reconciled} in-flight review(s), healed ${healed} stuck review(s), ` +
+      `pruned ${pruned} old record(s) (kept ${kept}), removed ${filesRemoved} stale file(s).`
   );
 }
 
