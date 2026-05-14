@@ -3,40 +3,44 @@
  * Detached background review worker.
  *
  * Spawned by `lib/auto-review.mjs` with `--cwd` and `--review-id`. Reads the
- * queued review record (which carries the prompt + model + effort + timeout),
- * runs `codex exec` to completion, and writes the verdict back into the
- * per-project state. This process is detached from the Claude session, so it is
- * free to block on Codex for as long as the review takes — but never forever.
+ * queued review record (which carries the prompt + backend + model + effort +
+ * timeout), runs the configured REVIEWER BACKEND to completion, and writes the
+ * verdict back into the per-project state. This process is detached from the
+ * Claude session, so it is free to block for as long as the review takes — but
+ * never forever.
  *
- * HANG PROTECTION / TERMINAL-STATE GUARANTEE:
- *   - `runCodexReview` enforces a hard wall-clock timeout and kills the codex
- *     process tree if it hangs.
- *   - Every exit path here — codex missing, spawn error, crash, non-zero exit,
- *     killed by signal, timeout, malformed output, state-write error, or this
- *     worker itself being killed (SIGTERM/SIGINT) — funnels through
+ * F1 — PLUGGABLE REVIEWER ABSTRACTION: the worker no longer calls codex
+ * directly. It looks up `request.backend` in the reviewer registry and calls
+ * the backend's three methods: `probe()` → `run()` → `parse()`. ONLY those
+ * three codex-coupling points became backend calls — the hang-protection
+ * machinery below is byte-for-byte unchanged.
+ *
+ * HANG PROTECTION / TERMINAL-STATE GUARANTEE (UNCHANGED):
+ *   - `backend.run` enforces a hard wall-clock timeout and kills the review
+ *     process tree if it hangs (the exec-* backends reuse `runCodexReview`).
+ *   - Every exit path here — backend unavailable, spawn error, crash, non-zero
+ *     exit, killed by signal, timeout, malformed output, state-write error, or
+ *     this worker itself being killed (SIGTERM/SIGINT) — funnels through
  *     `settleTerminal`, so a review can never be left stuck in `running`.
  *
  * @file
  */
 
-import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { killProcessTree, resolveReviewTimeoutMs } from "./lib/codex.mjs";
+import { getReviewerBackend } from "./lib/reviewers/index.mjs";
 import {
-  extractVerdictLine,
-  getCodexAvailability,
-  killProcessTree,
-  resolveReviewTimeoutMs,
-  runCodexReview
-} from "./lib/codex.mjs";
-import {
+  appendReviewGaps,
   ensureStateDir,
+  getPricingOverride,
   isTerminalStatus,
   listReviews,
   resolveReviewsDir,
   updateReviewIf
 } from "./lib/state.mjs";
+import { normalizeRateOverride } from "./lib/pricing.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 /**
@@ -55,40 +59,6 @@ function parseArgs(argv) {
     }
   }
   return options;
-}
-
-/**
- * Pull a human-readable error out of `codex exec` stderr. The CLI emits machine
- * errors as `ERROR: {"type":"error",...,"error":{"message":"..."}}` lines;
- * extract the inner message when present, otherwise return the last few
- * non-empty stderr lines.
- *
- * @param {string} stderr
- * @returns {string | null}
- */
-function extractCodexError(stderr) {
-  const text = String(stderr ?? "").trim();
-  if (!text) {
-    return null;
-  }
-  const lines = text.split(/\r?\n/);
-  for (const line of lines) {
-    const match = line.match(/^ERROR:\s*(\{.*\})\s*$/);
-    if (match) {
-      try {
-        const parsed = JSON.parse(match[1]);
-        const message = parsed?.error?.message ?? parsed?.message;
-        if (typeof message === "string" && message.trim()) {
-          return `codex error: ${message.trim()}`;
-        }
-      } catch {
-        // Fall through to the generic tail handling.
-      }
-      return `codex error: ${match[1]}`;
-    }
-  }
-  const tail = lines.filter(Boolean).slice(-3).join(" ");
-  return tail || null;
 }
 
 /**
@@ -246,16 +216,23 @@ async function main() {
     return;
   }
 
-  const outputFile = path.join(resolveReviewsDir(workspaceRoot), `${reviewId}.output.txt`);
+  const reviewsDir = resolveReviewsDir(workspaceRoot);
+  const outputFile = path.join(reviewsDir, `${reviewId}.output.txt`);
   const timeoutMs = resolveReviewTimeoutMs({ timeoutMs: request.timeoutMs });
+
+  // F1: resolve the reviewer backend. A missing/unknown `request.backend` — as
+  // on an old queued record from before F1 — resolves to the default
+  // (`exec-generic`), so the migration is non-breaking.
+  const backend = getReviewerBackend(request.backend);
+  const runCwd = request.cwd ?? cwd;
 
   appendLog(
     logFile,
-    `Starting ${review.kind} review with model=${request.model} effort=${request.effort} timeoutMs=${timeoutMs}.`
+    `Starting ${review.kind} review with backend=${backend.id} model=${request.model} effort=${request.effort} timeoutMs=${timeoutMs}.`
   );
   // Claim the review as `running` only if it has NOT been reconciled to a
   // terminal state in the meantime (compare-and-set). If the claim is rejected,
-  // a cleanup already finished this review — abort without running codex.
+  // a cleanup already finished this review — abort without running the backend.
   //
   // The worker records ITS OWN pid here, in the SAME compare-and-set that marks
   // the review `running`. The dispatcher also patches the pid after spawn(),
@@ -276,28 +253,45 @@ async function main() {
     return;
   }
 
-  const availability = getCodexAvailability(request.cwd ?? cwd);
+  // COUPLING POINT 1 (was getCodexAvailability) — the backend's availability
+  // probe. Time-boxed and non-throwing by the backend contract.
+  const availability = backend.probe({ cwd: runCwd, env: process.env, backendConfig: request.backendConfig });
   if (!availability.available) {
     const detail = availability.detail ? ` (${availability.detail})` : "";
-    appendLog(logFile, `Codex CLI unavailable${detail}.`);
+    appendLog(logFile, `Reviewer backend "${backend.id}" unavailable${detail}.`);
     settleTerminal("failed", {
-      errorMessage: `Codex CLI is not available${detail}.`
+      backend: backend.id,
+      errorMessage: `Reviewer backend "${backend.id}" is not available${detail}.`
     });
     process.exitCode = 1;
     return;
   }
 
-  let result;
+  // F6: resolve a project-level pricing override for the run's model, if any.
+  const rateOverride = request.model
+    ? normalizeRateOverride(getPricingOverride(workspaceRoot, request.model))
+    : null;
+
+  // COUPLING POINT 2 (was runCodexReview) — invoke the backend to completion
+  // under its hard wall-clock timeout. The backend contract forbids throwing;
+  // the try/catch is a belt-and-braces backstop.
+  let raw;
   try {
-    result = await runCodexReview({
-      cwd: request.cwd ?? cwd,
+    raw = await backend.run({
+      cwd: runCwd,
       prompt: request.prompt,
-      model: request.model,
-      effort: request.effort,
+      kind: review.kind,
+      profile: request.profile ?? (review.kind === "plan" ? "plan-devils-advocate" : "generic-code"),
+      base: request.base ?? null,
       outputFile,
+      schemaFile: request.schemaFile ?? null,
       timeoutMs,
+      model: request.model ?? null,
+      effort: request.effort ?? null,
       env: process.env,
-      // Track the codex child pid so the signal handlers can reap its process
+      rateOverride,
+      backendConfig: request.backendConfig ?? {},
+      // Track the review child pid so the signal handlers can reap its process
       // tree if this worker is killed mid-run.
       onChild: (pid) => {
         terminalState.codexChildPid = pid ?? null;
@@ -305,21 +299,23 @@ async function main() {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    appendLog(logFile, `codex exec threw: ${message}`);
+    appendLog(logFile, `backend "${backend.id}" run threw: ${message}`);
     settleTerminal("failed", {
-      errorMessage: `codex exec failed: ${message}`
+      backend: backend.id,
+      errorMessage: `Reviewer backend "${backend.id}" failed: ${message}`
     });
     process.exitCode = 1;
     return;
   }
 
-  // A hard timeout fired: the codex process tree was killed. This is terminal —
-  // never leave the review `running` just because codex hung.
-  if (result.timedOut) {
-    const seconds = Math.round(result.timeoutMs / 1000);
-    const detail = `codex exec timed out after ${seconds}s and was killed`;
+  // A hard timeout fired: the review process tree was killed. This is terminal
+  // — never leave the review `running` just because the backend hung.
+  if (raw.timedOut) {
+    const seconds = Math.round((raw.timeoutMs ?? timeoutMs) / 1000);
+    const detail = `reviewer backend "${backend.id}" timed out after ${seconds}s and was killed`;
     appendLog(logFile, detail);
     settleTerminal("failed", {
+      backend: backend.id,
       output: null,
       errorMessage: detail
     });
@@ -327,40 +323,63 @@ async function main() {
     return;
   }
 
-  // The authoritative verdict is the --output-last-message file. `codex exec`
-  // prints its session transcript to stderr (not stdout) and may exit non-zero
-  // even when it produced a partial answer, so the file — not the exit code —
-  // is the source of truth for "did we get a verdict".
-  let finalMessage = "";
-  try {
-    if (fs.existsSync(outputFile)) {
-      finalMessage = fs.readFileSync(outputFile, "utf8").trim();
-    }
-  } catch {
-    finalMessage = "";
-  }
+  // COUPLING POINT 3 (was extractVerdictLine + output-file read) — turn the
+  // raw result into the structured ParsedReview. Non-throwing by contract.
+  const parsed = backend.parse(raw, {
+    cwd: runCwd,
+    kind: review.kind,
+    profile: request.profile ?? (review.kind === "plan" ? "plan-devils-advocate" : "generic-code"),
+    model: request.model ?? null,
+    schemaFile: request.schemaFile ?? null,
+    rateOverride
+  });
 
-  if (!finalMessage) {
-    const detail =
-      (result.error &&
-        (result.error instanceof Error ? result.error.message : String(result.error))) ||
-      extractCodexError(result.stderr) ||
-      (result.signal ? `codex exec was killed (signal ${result.signal})` : null) ||
-      `codex exec exited with status ${result.status} and produced no verdict`;
+  if (!parsed.ok || !parsed.output) {
+    const detail = parsed.errorMessage || `backend "${backend.id}" produced no verdict`;
     appendLog(logFile, `Review failed: ${detail}`);
     settleTerminal("failed", {
+      backend: backend.id,
       output: null,
       errorMessage: detail
     });
-    process.exitCode = result.status === 0 ? 1 : result.status || 1;
+    process.exitCode = raw.status === 0 ? 1 : raw.status || 1;
     return;
   }
 
-  const verdict = extractVerdictLine(finalMessage);
-  appendLog(logFile, `Review completed. Verdict: ${verdict ?? "(none)"}`);
+  // F3/F4: stale detection — recompute the anchoring fingerprint and compare
+  // to the value captured at dispatch. A working tree that moved under the
+  // review is not an error; the result is just recorded with the recomputed
+  // hash so a later consumer (Phase 2) can detect the drift.
+  const reviewedInputHash =
+    (parsed.result && parsed.result.reviewedInputHash) ||
+    (request && typeof request.reviewedInputHash === "string"
+      ? request.reviewedInputHash
+      : null);
+
+  // F3: flatten this review's unverified-claim gaps into the accumulator.
+  if (parsed.result && Array.isArray(parsed.result.unverified) && parsed.result.unverified.length > 0) {
+    try {
+      appendReviewGaps(workspaceRoot, {
+        reviewId,
+        kind: review.kind,
+        gaps: parsed.result.unverified
+      });
+    } catch {
+      // The gap accumulator is best-effort — never let it block settling.
+    }
+  }
+
+  appendLog(
+    logFile,
+    `Review completed (backend=${backend.id}${parsed.degraded ? ", degraded" : ""}). Verdict: ${parsed.verdict ?? "(none)"}`
+  );
   settleTerminal("completed", {
-    verdict,
-    output: finalMessage,
+    verdict: parsed.verdict,
+    output: parsed.output,
+    result: parsed.result,
+    reviewedInputHash,
+    backend: backend.id,
+    degraded: parsed.degraded,
     errorMessage: null
   });
 }
