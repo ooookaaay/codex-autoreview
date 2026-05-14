@@ -16,6 +16,9 @@
  * @file
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 
@@ -33,13 +36,18 @@ import { binaryAvailable } from "./process.mjs";
 export const CODEX_DEFAULT_LABEL = "codex default";
 
 /**
- * Reasoning-effort values the Codex CLI accepts. Note the history: `xhigh` was
- * briefly mis-documented upstream; the codex-plugin-cc reference impl settled on
- * this exact set, validated against `codex` config.
+ * Reasoning-effort values the Codex CLI accepts for a background REVIEW run.
+ *
+ * Re-validated for Phase 1 (F5) against `codex-cli 0.130.0`: the research
+ * (`docs/research/codex-cli.md`) confirmed `minimal` FAILS with the default
+ * Codex toolset a review needs (read-only git + file inspection) — the model
+ * cannot drive the tools at that tier — and `none` likewise leaves no reasoning
+ * budget to trace cross-file logic. Both are therefore excluded from the set
+ * the plugin will accept for a review; the usable tiers are `low`/`medium`/
+ * `high`/`xhigh`. (`xhigh` itself was briefly mis-documented upstream; this
+ * exact set is validated against `codex` config.)
  */
 export const VALID_REASONING_EFFORTS = Object.freeze([
-  "none",
-  "minimal",
   "low",
   "medium",
   "high",
@@ -89,6 +97,80 @@ export function resolveReviewModel(config) {
   const configured =
     config && typeof config.model === "string" ? config.model.trim() : "";
   return configured || null;
+}
+
+/**
+ * Read ONLY the top-level `model = "..."` key out of the user's
+ * `~/.codex/config.toml`. Deliberately NOT a TOML parser — F5 hardening adds
+ * `--ignore-user-config` for hermeticity (no MCP servers / rules / personality
+ * leak into a review), but that flag also stops codex from reading the user's
+ * chosen default model. To stay non-breaking, the plugin re-supplies JUST that
+ * one value explicitly via `--model` (decision: consulted `codex`, recommended
+ * "Option C scoped to model extraction only").
+ *
+ * Scans only top-level lines (stops at the first `[table]` header) so a `model`
+ * key nested under some `[profile.x]` table is never mistaken for the global
+ * default. Returns `null` on any problem (missing file, unreadable, no key) —
+ * the caller then omits `--model` and accepts codex's built-in default. NEVER
+ * throws.
+ *
+ * @param {{ homeDir?: string, env?: NodeJS.ProcessEnv }} [options]
+ * @returns {string | null}
+ */
+export function readUserCodexDefaultModel(options = {}) {
+  const env = options.env ?? process.env;
+  const codexHome =
+    typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()
+      ? env.CODEX_HOME.trim()
+      : path.join(options.homeDir ?? os.homedir() ?? "", ".codex");
+  const configPath = path.join(codexHome, "config.toml");
+  let raw;
+  try {
+    raw = fs.readFileSync(configPath, "utf8");
+  } catch {
+    return null;
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    // Stop at the first table header — anything after is not a top-level key.
+    if (/^\[/.test(trimmed)) {
+      break;
+    }
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const match = trimmed.match(/^model\s*=\s*(.+?)\s*(?:#.*)?$/);
+    if (match) {
+      // Strip surrounding single or double quotes.
+      const value = match[1].replace(/^["']|["']$/g, "").trim();
+      return value || null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the model to actually pass to `codex exec --model` for a review,
+ * given the plugin's hermetic-run posture (`--ignore-user-config` is always on,
+ * see {@link buildCodexExecArgs}).
+ *
+ * Resolution order:
+ *   1. an explicit plugin-level model override ({@link resolveReviewModel});
+ *   2. else the user's own `~/.codex/config.toml` top-level `model` — so an
+ *      unset plugin override still respects the user's chosen model even though
+ *      `--ignore-user-config` stops codex from reading it itself;
+ *   3. else `null` — `--model` is omitted and codex's built-in default applies.
+ *
+ * @param {{ model?: unknown }} config
+ * @param {{ homeDir?: string, env?: NodeJS.ProcessEnv }} [options]
+ * @returns {string | null}
+ */
+export function resolveEffectiveReviewModel(config, options = {}) {
+  const override = resolveReviewModel(config);
+  if (override) {
+    return override;
+  }
+  return readUserCodexDefaultModel(options);
 }
 
 /**
@@ -208,6 +290,99 @@ export function normalizeModel(model) {
 }
 
 /**
+ * Maximum number of bytes of `codex exec` stdout/stderr the worker retains.
+ * `codex exec` prints its whole session transcript to stderr; on a pathological
+ * run that can be large. The authoritative verdict is the
+ * `--output-last-message` file, not these streams — they are only used to
+ * extract an error message — so a hard cap keeps a runaway transcript from
+ * ballooning worker memory. The TAIL is kept (errors surface at the end).
+ */
+export const MAX_CAPTURE_BYTES = 256 * 1024;
+
+/**
+ * Environment-variable names a hardened `codex exec` child is allowed to
+ * inherit. The privacy principle (design doc §4) is "minimal env-allowlist,
+ * never forward secret-env into the child". The research
+ * (`docs/research/codex-cli.md`) found `shell_environment_policy.inherit="core"`
+ * still exposes ~55 vars — not minimal — so the plugin builds the child env
+ * itself from this allowlist instead of relying on codex's own filtering.
+ *
+ * Only what `codex` genuinely needs to start, resolve its binary, find its auth
+ * (`CODEX_HOME`), and run read-only git is included. Anything not on this list
+ * — API keys, cloud creds, tokens, the user's broader shell env — is dropped.
+ */
+export const CODEX_ENV_ALLOWLIST = Object.freeze([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TERM",
+  // Codex's own home / auth location — without it codex cannot find its login.
+  "CODEX_HOME",
+  // Node toolchain dirs codex's vendored sub-binary may need to resolve.
+  "NODE_PATH",
+  "NVM_DIR",
+  // Proxy config a corporate network may require for codex to reach the API.
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  // Windows: codex's process resolution needs these.
+  "SYSTEMROOT",
+  "WINDIR",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA"
+]);
+
+/**
+ * Build a minimal environment for a hardened `codex exec` child by copying ONLY
+ * the {@link CODEX_ENV_ALLOWLIST} keys out of `sourceEnv`. This is the env the
+ * worker passes to `codex` — it keeps secret-bearing vars (API keys, cloud
+ * creds, the user's wider shell env) out of the child entirely, which is
+ * stronger than codex's own `shell_environment_policy` filtering.
+ *
+ * @param {NodeJS.ProcessEnv} [sourceEnv] - Defaults to `process.env`.
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function buildCodexChildEnv(sourceEnv = process.env) {
+  /** @type {NodeJS.ProcessEnv} */
+  const childEnv = {};
+  for (const key of CODEX_ENV_ALLOWLIST) {
+    const value = sourceEnv[key];
+    if (typeof value === "string" && value.length > 0) {
+      childEnv[key] = value;
+    }
+  }
+  return childEnv;
+}
+
+/**
+ * Cap a captured stream to {@link MAX_CAPTURE_BYTES}, keeping the TAIL (where
+ * `codex exec` prints its `ERROR:` lines). A truncation marker is prepended so
+ * the cut is observable in logs.
+ *
+ * @param {string} text
+ * @param {number} [maxBytes]
+ * @returns {string}
+ */
+export function capStreamCapture(text, maxBytes = MAX_CAPTURE_BYTES) {
+  const value = String(text ?? "");
+  if (value.length <= maxBytes) {
+    return value;
+  }
+  const tail = value.slice(value.length - maxBytes);
+  return `[...truncated ${value.length - maxBytes} bytes...]\n${tail}`;
+}
+
+/**
  * Check whether the `codex` CLI is available on PATH.
  *
  * The underlying `codex --version` probe is time-boxed (see
@@ -229,17 +404,44 @@ export function getCodexAvailability(cwd, options = {}) {
 }
 
 /**
- * Build the `codex exec` argument vector for a review run.
+ * Build the `codex exec` argument vector for a hardened background review run.
  *
  * `model` and `effort` are optional: when `null`/empty the corresponding flag
  * is omitted so `codex` falls back to the user's own `~/.codex/config.toml`
  * default. This avoids passing a hardcoded model that the account may reject.
+ *
+ * F5 HARDENING (verified against `codex-cli 0.130.0`, see
+ * `docs/research/codex-cli.md`) — every flag below is a privacy / anti-hang
+ * control for an UNATTENDED background run:
+ *   - `--ephemeral` — no session rollout file is persisted to `~/.codex`.
+ *   - `-c approval_policy="never"` — never block waiting for an approval
+ *     prompt (required for an unattended run; safe paired with `-s read-only`).
+ *   - `--ignore-user-config` / `--ignore-rules` — hermetic: the user's
+ *     `~/.codex/config.toml`, MCP servers, personality, and execpolicy
+ *     `.rules` cannot leak into or break the review.
+ *   - `-c shell_environment_policy.inherit="none"` — codex's spawned shell
+ *     inherits NO env. The research found `"core"` still exposes ~55 vars; the
+ *     worker already builds a minimal allowlisted env (see
+ *     {@link buildCodexChildEnv}), and a review only needs read-only git +
+ *     file inspection, so `"none"` is the correct, maximally private value.
+ *   - `-c history.persistence="none"` — defense-in-depth (a no-op for
+ *     `codex exec`, but harmless and honest about intent).
+ *   - `-s read-only` — filesystem read-only; a review never writes.
+ *   - `--skip-git-repo-check` / `--color never` — don't hard-fail in odd CWDs;
+ *     keep any human-readable fallback free of ANSI escapes.
+ *
+ * Set `params.json` to add `--json` (JSONL event stream — the F6 token-usage
+ * source). Set `params.schemaFile` to add `--output-schema <file>` (the F2
+ * claim-based structured-output path). Both are off by default so the legacy
+ * free-form `exec-generic` path is unaffected.
  *
  * @param {object} params
  * @param {string | null} [params.model]
  * @param {string | null} [params.effort]
  * @param {string} params.cwd
  * @param {string} params.outputFile - Where Codex writes its final message.
+ * @param {boolean} [params.json] - Add `--json` for the JSONL event stream.
+ * @param {string | null} [params.schemaFile] - Add `--output-schema <file>`.
  * @returns {string[]}
  */
 export function buildCodexExecArgs(params) {
@@ -258,9 +460,24 @@ export function buildCodexExecArgs(params) {
     "--skip-git-repo-check",
     "--color",
     "never",
-    "--output-last-message",
-    params.outputFile
+    // F5 hardening — unattended-run privacy / anti-hang controls.
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "-c",
+    'approval_policy="never"',
+    "-c",
+    'shell_environment_policy.inherit="none"',
+    "-c",
+    'history.persistence="none"'
   );
+  if (params.json) {
+    args.push("--json");
+  }
+  if (params.schemaFile) {
+    args.push("--output-schema", params.schemaFile);
+  }
+  args.push("--output-last-message", params.outputFile);
   return args;
 }
 
@@ -311,14 +528,22 @@ export function killProcessTree(pid, signal) {
  * caller reads. `codex exec` prints its session transcript to stderr (banner,
  * `ERROR: {...}` lines, etc.); stdout is typically empty.
  *
+ * F5 HARDENING: the codex child is spawned with a MINIMAL allowlisted env
+ * ({@link buildCodexChildEnv}) — secret-bearing vars never reach it — and the
+ * captured stdout/stderr are bounded to {@link MAX_CAPTURE_BYTES} so a runaway
+ * transcript cannot balloon worker memory.
+ *
  * @param {object} params
  * @param {string} params.cwd
  * @param {string} params.prompt
  * @param {string | null} [params.model]
  * @param {string | null} [params.effort]
  * @param {string} params.outputFile
+ * @param {boolean} [params.json] - Pass `--json` (F6 token-usage event stream).
+ * @param {string | null} [params.schemaFile] - Pass `--output-schema <file>`.
  * @param {number} [params.timeoutMs] - Hard cap; defaults to {@link DEFAULT_REVIEW_TIMEOUT_MS}.
- * @param {NodeJS.ProcessEnv} [params.env]
+ * @param {NodeJS.ProcessEnv} [params.env] - Source env; an allowlisted SUBSET
+ *   of it is what the child actually receives.
  * @param {(pid: number | undefined) => void} [params.onChild] - Invoked once
  *   with the spawned codex child pid (and again with `undefined` when it
  *   exits). Lets the caller reap the codex process tree if the caller itself is
@@ -330,7 +555,9 @@ export function runCodexReview(params) {
     model: params.model ?? null,
     effort: params.effort ?? null,
     cwd: params.cwd,
-    outputFile: params.outputFile
+    outputFile: params.outputFile,
+    json: Boolean(params.json),
+    schemaFile: params.schemaFile ?? null
   });
   const timeoutMs =
     typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs) && params.timeoutMs > 0
@@ -341,12 +568,17 @@ export function runCodexReview(params) {
 
   const onChild = typeof params.onChild === "function" ? params.onChild : null;
 
+  // F5: the child receives only an allowlisted SUBSET of the source env —
+  // secret-bearing vars (API keys, cloud creds, the user's wider shell env)
+  // are dropped entirely rather than relying on codex's own env filtering.
+  const childEnv = buildCodexChildEnv(params.env ?? process.env);
+
   return new Promise((resolve) => {
     let child;
     try {
       child = spawn("codex", args, {
         cwd: params.cwd,
-        env: params.env ?? process.env,
+        env: childEnv,
         detached: true,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true
@@ -382,11 +614,21 @@ export function runCodexReview(params) {
     /** @type {NodeJS.Timeout | null} */
     let killTimer = null;
 
+    // F5: bound the captured streams. `codex exec` prints its whole session
+    // transcript to stderr; keep only the most recent MAX_CAPTURE_BYTES (the
+    // tail, where `ERROR:` lines surface) so a runaway transcript cannot
+    // balloon worker memory. The authoritative verdict is the output file.
     child.stdout?.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
+      if (stdout.length > MAX_CAPTURE_BYTES * 2) {
+        stdout = stdout.slice(stdout.length - MAX_CAPTURE_BYTES);
+      }
     });
     child.stderr?.on("data", (chunk) => {
       stderr += chunk.toString("utf8");
+      if (stderr.length > MAX_CAPTURE_BYTES * 2) {
+        stderr = stderr.slice(stderr.length - MAX_CAPTURE_BYTES);
+      }
     });
 
     // Hard wall-clock timeout: escalate SIGTERM -> SIGKILL across the group.
@@ -423,8 +665,8 @@ export function runCodexReview(params) {
       }
       resolve({
         status: status ?? (signal ? 1 : 0),
-        stdout,
-        stderr,
+        stdout: capStreamCapture(stdout),
+        stderr: capStreamCapture(stderr),
         signal: signal ?? null,
         error: spawnError,
         timedOut,
@@ -484,4 +726,139 @@ export function extractVerdictLine(finalMessage) {
     .map((value) => value.trim())
     .find(Boolean);
   return line ?? null;
+}
+
+/**
+ * @typedef {object} CodexJsonStreamResult
+ * @property {{ tokensIn: number, tokensCachedIn: number, tokensOut: number, tokensReasoningOut: number } | null} usage
+ *   Token usage from the `turn.completed` event, or `null` if none was seen.
+ *   All-zeros usage (the `codex exec review` subcommand reports zeros) is
+ *   normalized to `null` — it is "unavailable", not "free".
+ * @property {string | null} finalMessage - The last `agent_message` item text.
+ * @property {string | null} errorMessage - A `turn.failed`/`error` message,
+ *   double-decoded when codex JSON-encoded it.
+ * @property {string | null} threadId - The session id from `thread.started`.
+ */
+
+/**
+ * Parse the JSONL event stream emitted by `codex exec --json` (F6 token-usage
+ * source). Stream facts verified against `codex-cli 0.130.0`
+ * (`docs/research/codex-cli.md`):
+ *   - usage lives ONLY in `turn.completed` →
+ *     `usage.{input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens}`;
+ *   - the final assistant message is the last `item.completed` whose
+ *     `item.type == "agent_message"`;
+ *   - failures arrive as an `error` line then `turn.failed`, and the `message`
+ *     is itself a JSON-encoded string (double-decode for the inner message).
+ *
+ * Tolerant by design: malformed lines are skipped, unknown `type` values are
+ * ignored (forward-compatible with future codex versions), and an all-zeros
+ * `usage` block (the review subcommand emits zeros) is treated as `null` so
+ * cost reporting is never misleadingly `$0`.
+ *
+ * @param {string} stdout - The raw `--json` JSONL stdout.
+ * @returns {CodexJsonStreamResult}
+ */
+export function parseCodexJsonStream(stdout) {
+  /** @type {CodexJsonStreamResult} */
+  const result = {
+    usage: null,
+    finalMessage: null,
+    errorMessage: null,
+    threadId: null
+  };
+  const text = String(stdout ?? "");
+  if (!text.trim()) {
+    return result;
+  }
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line[0] !== "{") {
+      continue;
+    }
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== "object") {
+      continue;
+    }
+    switch (event.type) {
+      case "thread.started": {
+        if (typeof event.thread_id === "string") {
+          result.threadId = event.thread_id;
+        }
+        break;
+      }
+      case "turn.completed": {
+        const usage = event.usage && typeof event.usage === "object" ? event.usage : null;
+        if (usage) {
+          const toCount = (value) =>
+            typeof value === "number" && Number.isFinite(value) && value > 0
+              ? Math.trunc(value)
+              : 0;
+          const tokensIn = toCount(usage.input_tokens);
+          const tokensCachedIn = Math.min(toCount(usage.cached_input_tokens), tokensIn);
+          const tokensOut = toCount(usage.output_tokens);
+          const tokensReasoningOut = toCount(usage.reasoning_output_tokens);
+          // All-zeros (the `codex exec review` subcommand reports zeros) means
+          // "usage unavailable", not "this turn was free" — keep it null.
+          if (tokensIn > 0 || tokensOut > 0) {
+            result.usage = { tokensIn, tokensCachedIn, tokensOut, tokensReasoningOut };
+          }
+        }
+        break;
+      }
+      case "item.completed": {
+        const item = event.item && typeof event.item === "object" ? event.item : null;
+        if (item && item.type === "agent_message" && typeof item.text === "string") {
+          result.finalMessage = item.text;
+        }
+        break;
+      }
+      case "error":
+      case "turn.failed": {
+        const rawMessage =
+          (typeof event.message === "string" && event.message) ||
+          (event.error && typeof event.error === "object" && typeof event.error.message === "string"
+            ? event.error.message
+            : null);
+        if (rawMessage) {
+          // codex JSON-encodes the inner error message; double-decode it.
+          let decoded = rawMessage;
+          let wasDecoded = false;
+          try {
+            const inner = JSON.parse(rawMessage);
+            if (inner && typeof inner === "object") {
+              const innerMessage =
+                (inner.error && typeof inner.error.message === "string"
+                  ? inner.error.message
+                  : null) ||
+                (typeof inner.message === "string" ? inner.message : null);
+              if (innerMessage) {
+                decoded = innerMessage;
+                wasDecoded = true;
+              }
+            }
+          } catch {
+            // Not JSON-encoded — use as-is.
+          }
+          // `error` and `turn.failed` usually carry the SAME error; prefer the
+          // first cleanly-decoded message and never let a later opaque
+          // `{...}`-style message clobber a good one.
+          if (!result.errorMessage || wasDecoded) {
+            result.errorMessage = decoded;
+          }
+        }
+        break;
+      }
+      default:
+        // Unknown future event type — ignore, never crash.
+        break;
+    }
+  }
+  return result;
 }
