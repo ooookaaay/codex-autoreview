@@ -41,10 +41,10 @@
  * @file
  */
 
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import process from "node:process";
 
+import { computeFindingFingerprint } from "./lib/review-schema.mjs";
 import {
   appendReviewGaps,
   claimUnsurfacedCompletedReviews,
@@ -107,41 +107,6 @@ function readHookInput() {
  */
 function asString(value) {
   return typeof value === "string" ? value : "";
-}
-
-/**
- * Deterministic fingerprint for a finding — the dedupe key for the accept/reject
- * memory ({@link isFindingDismissed} / `dismissFinding`). Per the
- * `DismissedFinding` contract in `state.mjs`, the fingerprint folds together the
- * file, a coarse line window, and the normalized finding title.
- *
- * NOTE (file-ownership): this primitive logically belongs in `review-schema.mjs`
- * alongside the schema it keys on, but Phase 2 file ownership keeps that module
- * out of this wave. It is implemented locally here so the accept/reject check
- * actually works now; a later pass should hoist a shared
- * `computeFindingFingerprint()` into `review-schema.mjs` and have both this hook
- * and the (future) dismiss command import it. See the wave summary.
- *
- * @param {{ file?: string | null, line?: number | null, claim?: string }} finding
- * @returns {string}
- */
-function computeFindingFingerprint(finding) {
-  const file = asString(finding && finding.file).trim().toLowerCase();
-  // Coarse line window (buckets of 10) so a finding that drifts a few lines
-  // after an edit still matches a prior dismissal.
-  const rawLine =
-    finding && typeof finding.line === "number" && Number.isFinite(finding.line)
-      ? Math.trunc(finding.line)
-      : null;
-  const lineWindow = rawLine == null ? "noline" : String(Math.floor(rawLine / 10) * 10);
-  const title = asString(finding && finding.claim)
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-  // Join with an explicit ASCII unit separator so the canonical form is
-  // unambiguous and stable regardless of whitespace in any component.
-  const canonical = [file, lineWindow, title].join("|");
-  return `sha256-${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
 /**

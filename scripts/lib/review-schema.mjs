@@ -22,6 +22,8 @@
  * @file
  */
 
+import { createHash } from "node:crypto";
+
 /**
  * Schema version. Bumped independently of the persisted STATE schema version
  * (see `state.mjs`) — this versions the review-RESULT object, that versions the
@@ -540,4 +542,38 @@ export function renderVerdictLine(result) {
   }
   const summary = asString(result.summary).trim();
   return `${result.verdict}: ${summary || "(no summary)"}`;
+}
+
+/**
+ * Deterministic fingerprint for a finding — the dedupe key for the accept/reject
+ * memory (`isFindingDismissed` / `dismissFinding` in `state.mjs`). Per the
+ * `DismissedFinding` contract there, the fingerprint folds together the file, a
+ * coarse line window, and the normalized finding title.
+ *
+ * Canonical home: this primitive keys on the {@link ReviewResult} `findings[]`
+ * shape, so it lives here alongside the schema it keys on. Both the
+ * surface-verdict hook and any dismiss command import it from here so the
+ * accept/reject memory stays consistent.
+ *
+ * The line is bucketed into windows of 10 so a finding that drifts a few lines
+ * after an edit still matches a prior dismissal. Components are joined with an
+ * explicit `|` separator so the canonical form is stable regardless of
+ * whitespace in any component.
+ *
+ * @param {{ file?: string | null, line?: number | null, claim?: string }} finding
+ * @returns {string}
+ */
+export function computeFindingFingerprint(finding) {
+  const file = asString(finding && finding.file).trim().toLowerCase();
+  const rawLine =
+    finding && typeof finding.line === "number" && Number.isFinite(finding.line)
+      ? Math.trunc(finding.line)
+      : null;
+  const lineWindow = rawLine == null ? "noline" : String(Math.floor(rawLine / 10) * 10);
+  const title = asString(finding && finding.claim)
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+  const canonical = [file, lineWindow, title].join("|");
+  return `sha256-${createHash("sha256").update(canonical).digest("hex")}`;
 }
