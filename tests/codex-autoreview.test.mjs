@@ -49,6 +49,7 @@ import {
   healStuckReviews,
   isReviewLikelyStuck,
   loadState,
+  markOnboarded,
   updateReviewIf,
   updateState,
   upsertReview
@@ -73,13 +74,24 @@ const LARGE_PLAN = [
 ].join("\n");
 
 /**
+ * Create a fresh git repo + fake-codex bin dir for an end-to-end test.
+ *
+ * The repo is marked onboarded by default: the Phase 2 onboarding gate blocks
+ * every dispatch hook until `config.onboardedAt` is set, and these tests
+ * exercise post-onboarding behavior. Pass `{ onboarded: false }` to exercise
+ * the not-yet-onboarded path explicitly.
+ *
+ * @param {{ onboarded?: boolean }} [options]
  * @returns {{ repo: string, binDir: string }}
  */
-function setupRepo() {
+function setupRepo(options = {}) {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   initGitRepo(repo);
+  if (options.onboarded !== false) {
+    markOnboarded(repo);
+  }
   return { repo, binDir };
 }
 
@@ -437,6 +449,7 @@ test("code review records a failure with a useful error when codex exec fails", 
   const binDir = makeTempDir();
   installFakeCodex(binDir, { mode: "fail" });
   initGitRepo(repo);
+  markOnboarded(repo);
   run("node", [CLI, "config", "--enable", "--cwd", repo, "--json"], { env: buildEnv(binDir) });
   fs.writeFileSync(path.join(repo, "README.md"), "broken change\n");
 
@@ -815,6 +828,7 @@ test("a hook no-ops promptly when codex hangs on --version (does not block)", ()
   const { repo } = (() => {
     const r = makeTempDir();
     initGitRepo(r);
+    markOnboarded(r);
     return { repo: r };
   })();
   run("node", [CLI, "config", "--enable", "--cwd", repo, "--json"], { env: buildEnv(binDir) });
@@ -1318,35 +1332,33 @@ test("surface-verdict hook is session-scoped — never steals another session's 
   assert.match(JSON.parse(fromA.stdout).hookSpecificOutput.additionalContext, /A's bug/);
 });
 
-test("surface-verdict hook ignores queued/running/failed reviews", () => {
+test("surface-verdict hook ignores queued/running reviews but surfaces failed ones", () => {
+  // Phase 2 surfacing contract: queued and (non-stale) running reviews are
+  // still in-flight so nothing is injected for them, but a FAILED review now
+  // surfaces a one-line "did NOT complete" notice — a silent automation
+  // failure must not be invisible.
   const { repo, binDir } = setupRepo();
   run("node", [CLI, "config", "--enable", "--cwd", repo, "--json"], { env: buildEnv(binDir) });
-  upsertReview(repo, { id: "r-queued", kind: "code", status: "queued" });
-  upsertReview(repo, { id: "r-running", kind: "plan", status: "running" });
+  upsertReview(repo, {
+    id: "r-queued",
+    kind: "code",
+    status: "queued",
+    request: { cwd: repo, prompt: "x", sessionId: "s1" }
+  });
+  upsertReview(repo, {
+    id: "r-running",
+    kind: "plan",
+    status: "running",
+    request: { cwd: repo, prompt: "x", sessionId: "s1" }
+  });
   upsertReview(repo, {
     id: "r-failed",
     kind: "code",
     status: "failed",
-    errorMessage: "codex exec timed out"
-  });
-  const result = run("node", [SURFACE_HOOK], {
-    input: JSON.stringify({ cwd: repo, session_id: "s1" }),
-    env: buildEnv(binDir)
-  });
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "", "only completed reviews with a verdict are injected");
-});
-
-test("surface-verdict hook truncates an oversized Codex output", () => {
-  const { repo, binDir } = setupRepo();
-  run("node", [CLI, "config", "--enable", "--cwd", repo, "--json"], { env: buildEnv(binDir) });
-  const huge = "ISSUES: big\n\n" + "x".repeat(5000);
-  upsertReview(repo, {
-    id: "done-huge",
-    kind: "code",
-    status: "completed",
-    verdict: "ISSUES: big",
-    output: huge
+    verdict: null,
+    output: null,
+    errorMessage: "codex exec timed out",
+    request: { cwd: repo, prompt: "x", sessionId: "s1" }
   });
   const result = run("node", [SURFACE_HOOK], {
     input: JSON.stringify({ cwd: repo, session_id: "s1" }),
@@ -1354,8 +1366,43 @@ test("surface-verdict hook truncates an oversized Codex output", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   const ctx = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-  assert.ok(ctx.length < 2500, `injected context should be bounded, was ${ctx.length}`);
+  // The failed review surfaces; the queued/running ones do not.
+  assert.match(ctx, /did NOT complete/i);
+  assert.match(ctx, /r-failed/);
+  assert.match(ctx, /codex exec timed out/);
+  assert.doesNotMatch(ctx, /r-queued/, "a queued review is still in-flight — nothing to surface");
+  assert.doesNotMatch(ctx, /r-running/, "a non-stale running review is still in-flight");
+
+  const reviews = loadState(repo).reviews;
+  assert.ok(reviews.find((r) => r.id === "r-failed").surfacedAt, "the failed review is stamped surfaced");
+  assert.ok(!reviews.find((r) => r.id === "r-queued").surfacedAt);
+  assert.ok(!reviews.find((r) => r.id === "r-running").surfacedAt);
+});
+
+test("surface-verdict hook truncates an oversized Codex output", () => {
+  // The Phase 2 surfacing contract bounds the injected context under the
+  // 10,000-char platform cap (not the old 2,500 budget) and tags an
+  // over-budget block with a truncation marker pointing at /last.
+  const { repo, binDir } = setupRepo();
+  run("node", [CLI, "config", "--enable", "--cwd", repo, "--json"], { env: buildEnv(binDir) });
+  const huge = "ISSUES: big\n\n" + "x".repeat(20_000);
+  upsertReview(repo, {
+    id: "done-huge",
+    kind: "code",
+    status: "completed",
+    verdict: "ISSUES: big",
+    output: huge,
+    request: { cwd: repo, prompt: "x", sessionId: "s1" }
+  });
+  const result = run("node", [SURFACE_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "s1" }),
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const ctx = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(ctx.length <= 10_000, `injected context should stay under the 10k cap, was ${ctx.length}`);
   assert.match(ctx, /truncated/i);
+  assert.match(ctx, /\/codex-autoreview:last/, "truncation must point at the full record");
 });
 
 // --- SessionEnd cleanup hook ---------------------------------------------
