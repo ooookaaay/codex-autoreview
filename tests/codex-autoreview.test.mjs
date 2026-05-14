@@ -919,6 +919,72 @@ test("healStuckReviews self-heals a SIGKILL-orphaned 'running' review to failed"
   assert.equal(healStuckReviews(repo).healed, 0);
 });
 
+test("isReviewLikelyStuck uses a PER-REVIEW bound from the configured timeout", () => {
+  // A review with a long configured timeout (20 min) that has been running
+  // 11 min — PAST the old fixed 10-min bound — must NOT be flagged stuck: its
+  // worker is still legitimately within its own hard timeout.
+  const longConfigured = {
+    status: "running",
+    updatedAt: new Date(Date.now() - 11 * 60_000).toISOString(),
+    request: { timeoutMs: 20 * 60_000 }
+  };
+  assert.equal(
+    isReviewLikelyStuck(longConfigured),
+    false,
+    "a legitimately long review within its configured timeout is NOT stuck"
+  );
+
+  // The SAME review, once it has been running past timeoutMs + grace + slack,
+  // IS stuck (its worker would have self-terminated at its own timeout).
+  const longExpired = {
+    status: "running",
+    updatedAt: new Date(Date.now() - (20 * 60_000 + 5 * 60_000)).toISOString(),
+    request: { timeoutMs: 20 * 60_000 }
+  };
+  assert.equal(
+    isReviewLikelyStuck(longExpired),
+    true,
+    "a long review past its own timeout + grace IS stuck"
+  );
+
+  // A review with NO recorded timeout falls back to the STALE_RUNNING_MS floor.
+  const noTimeoutFresh = {
+    status: "running",
+    updatedAt: new Date(Date.now() - (STALE_RUNNING_MS - 60_000)).toISOString()
+  };
+  assert.equal(isReviewLikelyStuck(noTimeoutFresh), false);
+  const noTimeoutStale = {
+    status: "running",
+    updatedAt: new Date(Date.now() - (STALE_RUNNING_MS + 60_000)).toISOString()
+  };
+  assert.equal(isReviewLikelyStuck(noTimeoutStale), true);
+});
+
+test("healStuckReviews does NOT heal a legitimately long-running review", () => {
+  const { repo } = setupRepo();
+  // A review with a 25-min configured timeout, running for 12 min. The old
+  // fixed 10-min bound would have wrongly healed it; the per-review bound must
+  // leave it alone — its worker is still within its own hard timeout.
+  upsertReview(repo, {
+    id: "long-legit",
+    kind: "code",
+    status: "running",
+    request: { cwd: repo, prompt: "x", timeoutMs: 25 * 60_000 }
+  });
+  const st = loadState(repo);
+  st.reviews.find((r) => r.id === "long-legit").updatedAt = new Date(
+    Date.now() - 12 * 60_000
+  ).toISOString();
+  fs.writeFileSync(
+    path.join(resolveStateDir(repo), "state.json"),
+    `${JSON.stringify(st, null, 2)}\n`,
+    "utf8"
+  );
+
+  assert.equal(healStuckReviews(repo).healed, 0, "a long-configured review is NOT falsely healed");
+  assert.equal(loadState(repo).reviews.find((r) => r.id === "long-legit").status, "running");
+});
+
 test("isReviewLikelyStuck flags non-terminal reviews past the stale bound", () => {
   const fresh = { status: "running", updatedAt: new Date().toISOString() };
   assert.equal(isReviewLikelyStuck(fresh), false);

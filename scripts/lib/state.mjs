@@ -41,13 +41,52 @@ const LOCK_RETRY_MS = 25;
  */
 
 /**
- * A review still `running` longer than this is almost certainly stuck (its
- * worker was killed before it could flush a terminal state, or the host slept).
- * `last`/`config` surface such jobs as likely-stuck rather than healthy. This
- * is deliberately generous — comfortably past the longest legitimate review
- * plus the worker's own kill grace period.
+ * Default staleness floor for a review with NO recorded per-review timeout
+ * (older records, or a request that never persisted `timeoutMs`). For a review
+ * that does carry `request.timeoutMs`, the staleness bound is computed from
+ * THAT value instead — see {@link staleBoundForReview} — because a project may
+ * configure a review timeout as long as 30 minutes, and a fixed 10-minute bound
+ * would falsely "heal" a legitimate long review whose worker is still alive.
+ *
+ * `last`/`config` surface jobs past their bound as likely-stuck rather than
+ * healthy. The value is deliberately generous — comfortably past a default
+ * review plus the worker's own kill grace period.
  */
 export const STALE_RUNNING_MS = 600_000;
+
+/**
+ * Extra slack added on top of a review's own hard timeout before it counts as
+ * stale: the worker's SIGTERM→SIGKILL kill grace, plus generous headroom for a
+ * slow final state write, lock contention, and clock skew. A review still
+ * `running` past `timeoutMs + STALE_GRACE_MS` genuinely cannot have a live
+ * worker — the worker would have self-terminated at its own `timeoutMs`.
+ */
+const STALE_GRACE_MS = 120_000;
+
+/**
+ * The staleness bound for a specific review, in milliseconds. Derived from the
+ * review's own recorded `request.timeoutMs` when present (so a legitimately
+ * long-configured review is never falsely healed), otherwise the
+ * {@link STALE_RUNNING_MS} floor. The result is never below the floor.
+ *
+ * @param {ReviewRecord | null | undefined} review
+ * @returns {number}
+ */
+export function staleBoundForReview(review) {
+  const requested =
+    review &&
+    review.request &&
+    typeof review.request === "object" &&
+    typeof review.request.timeoutMs === "number" &&
+    Number.isFinite(review.request.timeoutMs) &&
+    review.request.timeoutMs > 0
+      ? review.request.timeoutMs
+      : null;
+  if (requested == null) {
+    return STALE_RUNNING_MS;
+  }
+  return Math.max(STALE_RUNNING_MS, requested + STALE_GRACE_MS);
+}
 
 /**
  * The two terminal review statuses. A review in either of these is final: no
@@ -474,11 +513,17 @@ export function getLatestReview(cwd, options = {}) {
 
 /**
  * Decide whether a review looks stuck: still `queued` or `running` but last
- * touched longer than {@link STALE_RUNNING_MS} ago. A healthy review reaches a
- * terminal state (the worker enforces its own timeout); a job lingering in a
- * non-terminal state well past that bound means its worker died without
- * flushing a terminal state, so callers should warn instead of implying it is
- * still healthily in progress.
+ * touched longer than its staleness bound ago.
+ *
+ * The bound is PER-REVIEW: derived from the review's own recorded
+ * `request.timeoutMs` (+ kill grace + slack) via {@link staleBoundForReview},
+ * so a project that configured a long review timeout (up to 30 min) never has
+ * a legitimately long-running review falsely flagged. A healthy review reaches
+ * a terminal state at or before its own hard timeout; a job lingering well past
+ * that means its worker died (SIGKILL/OOM/crash) without flushing a terminal
+ * state, so callers should warn / self-heal instead of implying it is healthy.
+ *
+ * `staleMs` may be passed to force a fixed bound (used by tests).
  *
  * @param {ReviewRecord | null | undefined} review
  * @param {{ now?: number, staleMs?: number }} [options]
@@ -491,7 +536,7 @@ export function isReviewLikelyStuck(review, options = {}) {
   if (review.status !== "running" && review.status !== "queued") {
     return false;
   }
-  const staleMs = options.staleMs ?? STALE_RUNNING_MS;
+  const staleMs = options.staleMs ?? staleBoundForReview(review);
   const now = options.now ?? Date.now();
   const updatedAt = Date.parse(String(review.updatedAt ?? ""));
   if (!Number.isFinite(updatedAt)) {
@@ -615,7 +660,10 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
   const now = options.now ?? Date.now();
   const maxAgeMs = options.maxAgeMs ?? 24 * 60 * 60 * 1000;
   const keepRecent = Math.max(1, options.keepRecent ?? 5);
-  const staleMs = options.staleMs ?? STALE_RUNNING_MS;
+  // staleMs is intentionally NOT defaulted: when unset, isReviewLikelyStuck
+  // computes a PER-REVIEW bound from each review's own configured timeout, so a
+  // legitimately long review is never falsely healed. Tests may force a value.
+  const staleMs = options.staleMs;
   let reconciled = 0;
   let healed = 0;
   let kept = 0;
@@ -626,8 +674,8 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
     // 1. Reconcile in-flight reviews to a terminal state:
     //    (a) this session's reviews — its session is ending; and
     //    (b) ANY likely-stuck review, regardless of session — its worker is
-    //        certainly dead (SIGKILL/OOM/crash) since it outlived the worker's
-    //        own hard timeout by a wide margin.
+    //        certainly dead (SIGKILL/OOM/crash) since it outlived its own hard
+    //        timeout (+ kill grace + slack) by a wide margin.
     for (const review of state.reviews) {
       if (review.status !== "queued" && review.status !== "running") {
         continue;
@@ -700,7 +748,9 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
  */
 export function healStuckReviews(cwd, options = {}) {
   const now = options.now ?? Date.now();
-  const staleMs = options.staleMs ?? STALE_RUNNING_MS;
+  // Not defaulted: isReviewLikelyStuck computes a per-review bound from each
+  // review's own configured timeout. Tests may force a fixed value.
+  const staleMs = options.staleMs;
   let healed = 0;
   // Cheap pre-check without the lock: only take the write lock if something
   // actually looks stuck.
