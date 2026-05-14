@@ -142,6 +142,24 @@ setInterval(() => {}, 1e9);
 }
 
 /**
+ * Install a fake `codex` whose `--version` HANGS forever (it answers nothing
+ * and never exits). Used to verify the availability probe is time-boxed — a
+ * binary wedged on `--version` must be treated as unavailable, not block the
+ * caller indefinitely.
+ *
+ * @param {string} binDir
+ */
+export function installVersionHangingCodex(binDir) {
+  const codexPath = path.join(binDir, "codex");
+  const script = `#!/usr/bin/env node
+// Hang on every invocation, including --version.
+setInterval(() => {}, 1e9);
+`;
+  fs.writeFileSync(codexPath, script, "utf8");
+  fs.chmodSync(codexPath, 0o755);
+}
+
+/**
  * Build an environment with `binDir` prepended to PATH (so the fake codex wins).
  *
  * @param {string} binDir

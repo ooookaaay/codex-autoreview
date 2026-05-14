@@ -210,14 +210,21 @@ export function normalizeModel(model) {
 /**
  * Check whether the `codex` CLI is available on PATH.
  *
+ * The underlying `codex --version` probe is time-boxed (see
+ * {@link binaryAvailable}) so a codex binary wedged on `--version` is reported
+ * as unavailable rather than blocking the caller — important because this runs
+ * in hooks and in the background worker before the hard `codex exec` timeout
+ * would ever apply.
+ *
  * @param {string} cwd
- * @param {{ env?: NodeJS.ProcessEnv }} [options]
+ * @param {{ env?: NodeJS.ProcessEnv, timeoutMs?: number }} [options]
  * @returns {{ available: boolean, detail: string }}
  */
 export function getCodexAvailability(cwd, options = {}) {
   return binaryAvailable("codex", ["--version"], {
     cwd,
-    env: options.env ?? process.env
+    env: options.env ?? process.env,
+    ...(typeof options.timeoutMs === "number" ? { timeoutMs: options.timeoutMs } : {})
   });
 }
 

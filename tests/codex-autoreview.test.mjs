@@ -19,6 +19,7 @@ import {
   initGitRepo,
   installFakeCodex,
   installHangingCodex,
+  installVersionHangingCodex,
   makeTempDir,
   run,
   waitFor
@@ -30,6 +31,7 @@ import {
   VALID_REASONING_EFFORTS,
   buildCodexExecArgs,
   extractVerdictLine,
+  getCodexAvailability,
   hasEffortOverride,
   normalizeModel,
   normalizeReasoningEffort,
@@ -763,6 +765,52 @@ function seedQueuedReview(repo, request) {
   });
   return id;
 }
+
+test("getCodexAvailability is time-boxed — a codex hung on --version is 'unavailable'", () => {
+  const binDir = makeTempDir();
+  installVersionHangingCodex(binDir);
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const started = Date.now();
+  // Short probe timeout so the test is fast; the production default is 10s.
+  const availability = getCodexAvailability(repo, {
+    env: buildEnv(binDir),
+    timeoutMs: 1500
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(availability.available, false, "a codex hung on --version must be 'unavailable'");
+  assert.match(availability.detail, /did not respond/i);
+  assert.ok(elapsed < 10000, `the probe must return promptly, took ${elapsed}ms`);
+});
+
+test("a hook no-ops promptly when codex hangs on --version (does not block)", () => {
+  const binDir = makeTempDir();
+  installVersionHangingCodex(binDir);
+  const { repo } = (() => {
+    const r = makeTempDir();
+    initGitRepo(r);
+    return { repo: r };
+  })();
+  run("node", [CLI, "config", "--enable", "--cwd", repo, "--json"], { env: buildEnv(binDir) });
+  fs.appendFileSync(path.join(repo, "README.md"), "change\n");
+
+  const started = Date.now();
+  // The code-review hook probes codex availability; with a hung `codex
+  // --version` it must still return — bounded by the probe timeout — and
+  // no-op cleanly rather than hang the session.
+  const result = run("node", [CODE_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "s1" }),
+    env: buildEnv(binDir)
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "", "the hook must not emit a blocking decision");
+  assert.match(result.stderr, /not available/i);
+  // 10s default probe timeout + node startup; comfortably under the hook's 30s.
+  assert.ok(elapsed < 20000, `the hook must return well within its 30s budget, took ${elapsed}ms`);
+});
 
 test("runCodexReview enforces a hard timeout and kills the codex process tree", async () => {
   const binDir = makeTempDir();
