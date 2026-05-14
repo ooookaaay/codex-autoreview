@@ -1510,6 +1510,75 @@ test("session-end hook NEVER prunes another active session's running review or f
   );
 });
 
+test("session-end pruning keeps terminal history even behind many fresh in-flight reviews", () => {
+  const { repo, binDir } = setupRepo();
+  const reviewsDir = path.join(resolveStateDir(repo), "reviews");
+  fs.mkdirSync(reviewsDir, { recursive: true });
+
+  // A handful of OLD terminal reviews carrying real verdicts — these are the
+  // verdict history `/codex-autoreview:last` depends on.
+  for (let index = 0; index < 4; index += 1) {
+    upsertReview(repo, {
+      id: `verdict-${index}`,
+      kind: "code",
+      status: "completed",
+      verdict: `CLEAN: ok ${index}`,
+      output: `CLEAN: ok ${index}`
+    });
+    fs.writeFileSync(path.join(reviewsDir, `verdict-${index}.log`), "v\n", "utf8");
+  }
+  // Many FRESH in-flight reviews from another active session — they sort
+  // newest-first, ahead of the terminal ones. The OLD bug counted keepRecent
+  // over the mixed list, so these would push every terminal review past the
+  // budget and prune all verdict history.
+  for (let index = 0; index < 8; index += 1) {
+    upsertReview(repo, {
+      id: `busy-${index}`,
+      kind: "code",
+      status: "running",
+      request: { cwd: repo, prompt: "x", sessionId: "other-session" }
+    });
+  }
+  // Backdate only the terminal verdicts so they are "old"; leave the in-flight
+  // reviews fresh.
+  const st = loadState(repo);
+  for (const review of st.reviews) {
+    if (review.id.startsWith("verdict-")) {
+      review.updatedAt = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
+    }
+  }
+  fs.writeFileSync(
+    path.join(resolveStateDir(repo), "state.json"),
+    `${JSON.stringify(st, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SESSION_END_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "ending-session" }),
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const survivors = loadState(repo).reviews;
+  // keepRecent (5) is counted over TERMINAL reviews only — all 4 terminal
+  // verdicts (< 5) must survive, and their files with them.
+  for (let index = 0; index < 4; index += 1) {
+    const kept = survivors.find((r) => r.id === `verdict-${index}`);
+    assert.ok(kept, `terminal verdict verdict-${index} must NOT be pruned`);
+    assert.ok(
+      fs.existsSync(path.join(reviewsDir, `verdict-${index}.log`)),
+      `terminal verdict-${index} file must NOT be deleted`
+    );
+  }
+  // All 8 in-flight reviews are also kept (non-terminal, never pruned).
+  for (let index = 0; index < 8; index += 1) {
+    assert.ok(
+      survivors.find((r) => r.id === `busy-${index}`),
+      `non-terminal busy-${index} must be kept`
+    );
+  }
+});
+
 test("session-end hook self-heals a stuck review from ANOTHER session", () => {
   const { repo, binDir } = setupRepo();
   // A stuck running review owned by session-X (its worker was SIGKILL'd).

@@ -773,25 +773,37 @@ export function reconcileAndPruneReviews(cwd, options = {}) {
       }
     }
 
-    // 2. Prune by age + count. CRITICAL: only TERMINAL reviews are ever
-    //    eligible. A `queued`/`running` review is always kept — it may belong
-    //    to ANOTHER active Claude session on this repo whose worker is still
-    //    running; deleting its record (and, downstream, its files) would let
-    //    that worker recreate a corrupt partial record on completion. The most
-    //    recent few terminal reviews are also always kept so `last` still works.
+    // 2. Prune by age + count. CRITICAL invariants:
+    //    - only TERMINAL reviews are ever eligible. A `queued`/`running` review
+    //      is always kept — it may belong to ANOTHER active session whose
+    //      worker is still running; deleting its record would let that worker
+    //      recreate a corrupt partial record on completion.
+    //    - `keepRecent` is counted over TERMINAL reviews ONLY, not the overall
+    //      list. Counting it over the mixed list means a handful of fresh
+    //      in-flight reviews could push every terminal review past the budget
+    //      and prune all verdict history — breaking `/codex-autoreview:last`.
     const sorted = [...state.reviews].sort((left, right) =>
       String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
     );
     /** @type {ReviewRecord[]} */
     const survivors = [];
-    for (let index = 0; index < sorted.length; index += 1) {
-      const review = sorted[index];
+    let terminalSeen = 0;
+    for (const review of sorted) {
       const isTerminal = review.status === "completed" || review.status === "failed";
+      if (!isTerminal) {
+        // Non-terminal reviews are always kept, regardless of session or age.
+        survivors.push(review);
+        kept += 1;
+        continue;
+      }
+      // Among terminal reviews: keep the most recent `keepRecent` outright; the
+      // rest are pruned if they are too old or over the count budget.
+      const terminalIndex = terminalSeen;
+      terminalSeen += 1;
       const updatedAt = Date.parse(String(review.updatedAt ?? ""));
       const tooOld = Number.isFinite(updatedAt) && now - updatedAt > maxAgeMs;
-      const overKeepBudget = index >= keepRecent;
-      const prunable = isTerminal && (tooOld || overKeepBudget) && index >= keepRecent;
-      if (prunable) {
+      const overKeepBudget = terminalIndex >= keepRecent;
+      if (terminalIndex >= keepRecent && (tooOld || overKeepBudget)) {
         prunedIds.push(review.id);
       } else {
         survivors.push(review);
