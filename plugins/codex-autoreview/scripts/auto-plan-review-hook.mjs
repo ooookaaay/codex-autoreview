@@ -31,6 +31,12 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 const MIN_REVIEWABLE_PLAN_CHARS = 240;
 const PROJECT_INSTRUCTIONS_FILE = ".codex-autoreview.md";
 
+// F-02: a `planFilePath` from the tool input is untrusted. Cap how much of it
+// we will ever read so a crafted payload pointing at a huge file cannot blow up
+// the reviewer prompt. Oversized plan files are TRUNCATED (not rejected) to
+// match the established pattern in `lib/prompts.mjs` (`readProjectInstructions`).
+const MAX_PLAN_FILE_CHARS = 256 * 1024;
+
 /**
  * Read and parse the hook's stdin JSON. A missing, empty, or MALFORMED stdin
  * payload yields `null` — the caller treats that as a clean no-op (exit 0, no
@@ -68,12 +74,70 @@ function logNote(message) {
 }
 
 /**
+ * Safely read an untrusted `planFilePath` from the tool input (F-02).
+ *
+ * The path is attacker-influenceable: a crafted hook payload could point it at
+ * an arbitrary local file and exfiltrate its contents into the reviewer prompt.
+ * Before reading we require, in order:
+ *
+ *   1. Workspace containment — the path (absolute, or relative to
+ *      `workspaceRoot`) must `fs.realpathSync` to something that stays inside
+ *      `workspaceRoot`. The realpath check also defeats symlink escapes.
+ *   2. Size cap — files over {@link MAX_PLAN_FILE_CHARS} are read-and-truncated
+ *      (matching `readProjectInstructions` in `lib/prompts.mjs`), never used
+ *      whole.
+ *
+ * Any validation failure is a clean no-op: returns `""`, never throws — the
+ * hook's contract is that it must never block the session.
+ *
+ * @param {string} planFilePath - Raw, untrusted path from `tool_input`.
+ * @param {string} workspaceRoot - Resolved workspace root to contain reads to.
+ * @returns {string}
+ */
+function readPlanFile(planFilePath, workspaceRoot) {
+  try {
+    const root = fs.realpathSync(workspaceRoot);
+    // Resolve relative paths against the workspace root, not process.cwd().
+    const resolvedInput = path.resolve(root, planFilePath);
+    // realpath collapses symlinks; if the real target escapes the workspace,
+    // the containment check below rejects it.
+    const realPath = fs.realpathSync(resolvedInput);
+    const contained =
+      realPath === root || realPath.startsWith(root + path.sep);
+    if (!contained) {
+      logNote(
+        "codex-autoreview: plan review skipped — planFilePath resolves outside the workspace."
+      );
+      return "";
+    }
+
+    const stats = fs.statSync(realPath);
+    if (!stats.isFile()) {
+      return "";
+    }
+
+    const raw = fs.readFileSync(realPath, "utf8");
+    if (raw.length > MAX_PLAN_FILE_CHARS) {
+      return `${raw
+        .slice(0, MAX_PLAN_FILE_CHARS)
+        .trim()}\n\n[... plan file truncated at ${MAX_PLAN_FILE_CHARS} chars ...]`;
+    }
+    return raw.trim();
+  } catch {
+    // Missing file, unreadable path, broken symlink, permission error — all
+    // collapse to a clean no-op.
+    return "";
+  }
+}
+
+/**
  * Extract the plan text from the ExitPlanMode tool input.
  *
  * @param {Record<string, unknown>} input
+ * @param {string} workspaceRoot - Resolved workspace root; bounds file reads.
  * @returns {string}
  */
-function extractPlanText(input) {
+function extractPlanText(input, workspaceRoot) {
   const toolInput =
     input.tool_input && typeof input.tool_input === "object"
       ? /** @type {Record<string, unknown>} */ (input.tool_input)
@@ -86,11 +150,7 @@ function extractPlanText(input) {
   const planFilePath =
     typeof toolInput.planFilePath === "string" ? toolInput.planFilePath : "";
   if (planFilePath) {
-    try {
-      return fs.readFileSync(planFilePath, "utf8").trim();
-    } catch {
-      return "";
-    }
+    return readPlanFile(planFilePath, workspaceRoot);
   }
 
   return "";
@@ -150,7 +210,7 @@ function main() {
     return;
   }
 
-  const planText = extractPlanText(input);
+  const planText = extractPlanText(input, workspaceRoot);
   if (!planText) {
     return;
   }
