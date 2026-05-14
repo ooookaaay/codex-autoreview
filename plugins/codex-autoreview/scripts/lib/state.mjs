@@ -316,10 +316,12 @@ function sleepSync(ms) {
  * processes and the detached review worker cannot interleave their
  * read-modify-write cycles on the shared state file.
  *
- * The lock is an `O_EXCL` lock file. A lock older than {@link LOCK_STALE_MS} is
- * treated as abandoned by a crashed writer and forcibly broken. If the lock
- * cannot be acquired within {@link LOCK_ACQUIRE_TIMEOUT_MS}, `fn` is run anyway
- * (an unsynchronized write is strictly better than dropping the update).
+ * The lock is an `O_EXCL` lock file. A lock older than {@link LOCK_STALE_MS}
+ * whose content is unchanged across the wait interval AND whose owner pid is
+ * no longer alive is treated as abandoned by a crashed writer and forcibly
+ * broken. If the lock cannot be acquired within
+ * {@link LOCK_ACQUIRE_TIMEOUT_MS}, `fn` is run anyway (an unsynchronized write
+ * is strictly better than dropping the update).
  *
  * @template T
  * @param {string} cwd
@@ -349,6 +351,33 @@ function withStateLock(cwd, fn) {
     }
   };
 
+  /**
+   * Liveness check for a lock judged stale by age + unchanged content. The lock
+   * content is `<pid>:<token>`; a slow-but-live writer (e.g. an OS-suspended
+   * process, a long `updateState`) can exceed {@link LOCK_STALE_MS} without
+   * having crashed — breaking its lock then would cause concurrent writes and
+   * lost updates. `process.kill(pid, 0)` probes the owner: `ESRCH` => gone,
+   * success or `EPERM` (alive but not ours) => alive. A malformed/legacy lock
+   * with no parseable pid is treated as NOT alive so it stays breakable and the
+   * plugin cannot deadlock on a genuinely abandoned lock.
+   *
+   * @param {string | null} lockContent
+   * @returns {boolean} true if the owning process is (or may be) still alive.
+   */
+  const isLockOwnerAlive = (lockContent) => {
+    if (lockContent === null) return false;
+    const pid = Number.parseInt(lockContent.split(":")[0], 10);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      // EPERM: process exists but is owned by another user — still alive.
+      // ESRCH (or anything else): treat as gone so the stale lock is breakable.
+      return /** @type {NodeJS.ErrnoException} */ (error).code === "EPERM";
+    }
+  };
+
   while (!acquired) {
     try {
       const fd = fs.openSync(lockFile, "wx");
@@ -369,8 +398,17 @@ function withStateLock(cwd, fn) {
         const age = Date.now() - fs.statSync(lockFile).mtimeMs;
         if (age > LOCK_STALE_MS) {
           // Re-read: only remove if the content is unchanged since `before`,
-          // i.e. we are breaking the exact stale lock we observed.
-          if (before !== null && readLock() === before) {
+          // i.e. we are breaking the exact stale lock we observed. AND only if
+          // the owner pid is not alive — a live-but-slow writer must keep its
+          // lock even past LOCK_STALE_MS, or both processes write concurrently
+          // and one update is lost (atomic rename prevents torn JSON, not lost
+          // writes). The unchanged-content guard still matters: it defends
+          // against a recycled pid that is falsely "alive".
+          if (
+            before !== null &&
+            readLock() === before &&
+            !isLockOwnerAlive(before)
+          ) {
             fs.rmSync(lockFile, { force: true });
           }
           continue;
