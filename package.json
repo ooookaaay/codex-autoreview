@@ -1,0 +1,14 @@
+{
+  "name": "codex-autoreview",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Claude Code plugin: automatic background Codex review of plans and code changes.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

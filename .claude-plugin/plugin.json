@@ -1,0 +1,9 @@
+{
+  "name": "codex-autoreview",
+  "version": "0.1.0",
+  "description": "Automatically sends Claude's plans and code changes to the Codex CLI for background devil's-advocate and bug-finding reviews.",
+  "author": {
+    "name": "codex-autoreview contributors"
+  },
+  "license": "Apache-2.0"
+}
