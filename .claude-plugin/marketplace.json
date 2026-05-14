@@ -1,0 +1,35 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "codex-autoreview",
+  "description": "Single-plugin marketplace for codex-autoreview — automatic background Codex review of Claude Code plans and code changes.",
+  "owner": {
+    "name": "codex-autoreview contributors"
+  },
+  "metadata": {
+    "description": "Automatic background Codex review of plans and code changes for Claude Code.",
+    "version": "0.3.0"
+  },
+  "plugins": [
+    {
+      "name": "codex-autoreview",
+      "description": "Automatically sends Claude's plans and code changes to the Codex CLI for background verifier-style reviews — devil's-advocate plan critique and claim-based bug finding — surfaces the verdicts back into the session, tracks tokens and cost, and cleans up after itself.",
+      "version": "0.3.0",
+      "author": {
+        "name": "codex-autoreview contributors"
+      },
+      "homepage": "https://github.com/ooookaaay/codex-autoreview",
+      "repository": "https://github.com/ooookaaay/codex-autoreview",
+      "license": "Apache-2.0",
+      "category": "code-review",
+      "keywords": [
+        "codex",
+        "code-review",
+        "plan-review",
+        "verifier",
+        "claude-code-plugin",
+        "background-review"
+      ],
+      "source": "."
+    }
+  ]
+}

@@ -46,18 +46,48 @@ And when idle, the statusline reflects the last verdict: `CLEAN · VERIFIED`,
 
 ## Install
 
-```sh
-# 1. Install the Codex CLI separately (the plugin does not bundle it)
-npm install -g @openai/codex
-codex login            # if your model provider requires it
+The plugin has **no npm dependencies** and needs **Node ≥ 18.18** — the same
+runtime Claude Code already uses. Setup is three steps: install the Codex CLI,
+add the plugin, then enable & onboard it per project.
 
-# 2. Add the plugin to Claude Code (/plugin) — point it at this directory.
-#    No npm dependencies; Node >= 18.18 (the same one Claude Code uses).
+### 1. Install the Codex CLI (a separate prerequisite)
+
+The plugin does **not** bundle Codex — it shells out to a `codex` binary on your
+`PATH`.
+
+```sh
+npm install -g @openai/codex
+codex login            # only if your model provider requires it
+codex --version        # confirm it resolves
 ```
 
-## Quick start
+Without `codex`, every hook is a clean no-op and `/codex-autoreview:doctor`
+tells you exactly what's missing — the plugin never breaks your session.
 
-Reviews are **off per project** by default. Enable and onboard:
+### 2. Add the plugin to Claude Code
+
+**From GitHub (recommended):**
+
+```sh
+claude plugin marketplace add ooookaaay/codex-autoreview
+claude plugin install codex-autoreview@codex-autoreview
+```
+
+**From a local clone** (for development or air-gapped setups):
+
+```sh
+git clone https://github.com/ooookaaay/codex-autoreview
+claude plugin marketplace add ./codex-autoreview
+claude plugin install codex-autoreview@codex-autoreview
+```
+
+Either way you can also use the interactive `/plugin` menu inside Claude Code.
+Verify with `claude plugin list` — `codex-autoreview` should appear enabled.
+
+### 3. Enable & onboard it for a project
+
+Reviews are **off per project** by default — installing the plugin changes
+nothing until you opt a repo in:
 
 ```
 /codex-autoreview:config --enable
@@ -68,9 +98,10 @@ Reviews are **off per project** by default. Enable and onboard:
 optional `.codex-autoreview.md`). Until onboarding completes, the review hooks
 stay a clean no-op.
 
-To show the live statusline indicator, add this to your Claude Code
-`settings.json` (a plugin manifest cannot register `statusLine` — Claude Code
-does not honor that key from a plugin):
+### 4. (Optional) Show the live statusline indicator
+
+A plugin manifest cannot register `statusLine` — Claude Code does not honor that
+key from a plugin — so add it to your Claude Code `settings.json` yourself:
 
 ```json
 {
@@ -82,6 +113,34 @@ does not honor that key from a plugin):
 ```
 
 If you already have a statusline, add this as one segment instead of replacing it.
+
+### Updating & uninstalling
+
+```sh
+claude plugin marketplace update codex-autoreview   # pull the latest
+claude plugin uninstall codex-autoreview            # remove it
+```
+
+---
+
+## Quick start
+
+Once installed and onboarded, you do nothing — reviews happen on their own:
+
+1. **Plan a change.** When Claude leaves plan mode (`ExitPlanMode`), a
+   devil's-advocate plan review fires in the background.
+2. **Write code.** When Claude stops (`Stop`), a bug-finding review runs over
+   the uncommitted working tree.
+3. **Keep working.** The next time you submit a prompt, any finished verdict is
+   injected as context — verdict + high/medium findings + critical gaps only.
+4. **Push.** A `git push` is warned or blocked if the last review found blockers.
+
+Want a review right now, on demand?
+
+```
+/codex-autoreview:run            # review the current working tree
+/codex-autoreview:run plan       # review the last plan
+```
 
 ---
 
@@ -258,6 +317,36 @@ reviews. You can always replay the full last verdict manually:
 
 ---
 
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `/codex-autoreview:config` | View or change per-project settings: enable/disable, model, effort, timeout. |
+| `/codex-autoreview:last` | Show the last saved Codex verdict (plan or code). |
+| `/codex-autoreview:run` | Run a review on demand as a real Claude subagent. |
+| `/codex-autoreview:doctor` | Self-diagnosis: codex, config, stuck reviews, orphans, logs, pricing. |
+| `/codex-autoreview:onboard` | Re-run the onboarding flow. |
+
+---
+
+## Troubleshooting
+
+Start with `/codex-autoreview:doctor` — it checks the Codex install and login,
+the per-project config, stuck or orphaned reviews, log bloat, and pricing
+staleness, and tells you what to fix.
+
+| Symptom | Likely cause & fix |
+| --- | --- |
+| Nothing happens on plan/stop | Reviews are off or onboarding is incomplete for this repo — run `/codex-autoreview:config --enable` then `/codex-autoreview:onboard`. |
+| `codex` not found | The Codex CLI is not on `PATH` — `npm install -g @openai/codex`, then re-check with `codex --version`. |
+| Reviews `FAILED` immediately | Codex auth/model issue — run `codex login`, and check `--model` is one your account can access (or reset it with `--model ""`). |
+| A review is stuck `running` | It is flagged stale by the statusline and `/codex-autoreview:last`; `SessionEnd` and the next dispatch self-heal it to `failed`. `/codex-autoreview:doctor` can also report it. |
+| Statusline indicator missing | The `statusLine` entry must be in your own Claude Code `settings.json` — see Install step 4. A plugin manifest cannot register it. |
+| Verdict never surfaced | Verdicts surface once each, into the **next** prompt after the review finishes — replay any time with `/codex-autoreview:last`. |
+| Cost shows "unknown" | The model is not in the dated pricing table — set `pricing.<modelId>` per project or `--price-in`/`--price-out` per run. |
+
+---
+
 ## Privacy
 
 Designed privacy-first. What you should know:
@@ -284,16 +373,6 @@ Designed privacy-first. What you should know:
 
 ---
 
-## Commands
-
-| Command | Purpose |
-| --- | --- |
-| `/codex-autoreview:config` | View or change per-project settings: enable/disable, model, effort, timeout. |
-| `/codex-autoreview:last` | Show the last saved Codex verdict (plan or code). |
-| `/codex-autoreview:run` | Run a review on demand as a real Claude subagent. |
-| `/codex-autoreview:doctor` | Self-diagnosis: codex, config, stuck reviews, orphans, logs, pricing. |
-| `/codex-autoreview:onboard` | Re-run the onboarding flow. |
-
 ## Requirements
 
 - **Node.js ≥ 18.18.0** — already present if you have Claude Code.
@@ -306,6 +385,8 @@ Designed privacy-first. What you should know:
 ```
 npm test
 ```
+
+No dependencies, no build — the suite is plain `node --test`.
 
 ## License
 
