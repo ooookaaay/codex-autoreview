@@ -16,7 +16,12 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { resolveReviewEffort, resolveReviewModel, spawnDetached } from "./codex.mjs";
+import {
+  resolveReviewEffort,
+  resolveReviewModel,
+  resolveReviewTimeoutMs,
+  spawnDetached
+} from "./codex.mjs";
 import {
   generateReviewId,
   resolveReviewLogFile,
@@ -43,7 +48,7 @@ export const SESSION_ID_ENV = "CODEX_AUTOREVIEW_SESSION_ID";
  * @param {string} params.cwd - Working directory for the Codex run.
  * @param {"plan" | "code"} params.kind - Which review this is.
  * @param {string} params.prompt - The review prompt to hand to Codex.
- * @param {{ model?: unknown, effort?: unknown }} params.config
+ * @param {{ model?: unknown, effort?: unknown, timeoutMs?: unknown }} params.config
  * @param {string | null} [params.sessionId] - Claude session id, if known.
  * @param {(command: string, args: string[], options: object) => { pid: number | null }} [params.spawn]
  *   - Injectable detached-spawn function (defaults to `spawnDetached`), for tests.
@@ -57,6 +62,7 @@ export function dispatchBackgroundReview(params) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const model = resolveReviewModel(config);
   const effort = resolveReviewEffort(config);
+  const timeoutMs = resolveReviewTimeoutMs(config);
   const reviewId = generateReviewId(kind === "plan" ? "plan" : "code");
   const logFile = resolveReviewLogFile(workspaceRoot, reviewId);
 
@@ -75,6 +81,7 @@ export function dispatchBackgroundReview(params) {
       prompt,
       model,
       effort,
+      timeoutMs,
       ...(sessionId ? { sessionId } : {})
     }
   });

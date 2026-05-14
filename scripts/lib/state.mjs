@@ -36,7 +36,18 @@ const LOCK_RETRY_MS = 25;
  * @property {boolean} enabled - Whether the automatic reviews are turned on.
  * @property {string | null} model - Codex model override, or null for default.
  * @property {string | null} effort - Codex reasoning effort override, or null.
+ * @property {number | null} timeoutMs - Hard per-review `codex exec` timeout in
+ *   milliseconds, or null to use the built-in default.
  */
+
+/**
+ * A review still `running` longer than this is almost certainly stuck (its
+ * worker was killed before it could flush a terminal state, or the host slept).
+ * `last`/`config` surface such jobs as likely-stuck rather than healthy. This
+ * is deliberately generous — comfortably past the longest legitimate review
+ * plus the worker's own kill grace period.
+ */
+export const STALE_RUNNING_MS = 600_000;
 
 /**
  * @typedef {object} ReviewRecord
@@ -49,6 +60,11 @@ const LOCK_RETRY_MS = 25;
  * @property {string} createdAt - ISO timestamp.
  * @property {string} updatedAt - ISO timestamp.
  * @property {string | null} logFile - Absolute path to the job log, if any.
+ * @property {number | null} [pid] - Detached worker pid, when known.
+ * @property {string | null} [surfacedAt] - ISO timestamp when the completed
+ *   verdict was injected into a Claude session, or absent/null if not yet.
+ * @property {object} [request] - The queued request payload (carries the
+ *   prompt, model, effort, timeout, and the Claude `sessionId` when known).
  */
 
 function nowIso() {
@@ -64,7 +80,8 @@ function defaultState() {
     config: {
       enabled: false,
       model: null,
-      effort: null
+      effort: null,
+      timeoutMs: null
     },
     reviews: []
   };
@@ -438,4 +455,146 @@ export function getLatestReview(cwd, options = {}) {
       String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
     );
   return reviews[0] ?? null;
+}
+
+/**
+ * Decide whether a review looks stuck: still `queued` or `running` but last
+ * touched longer than {@link STALE_RUNNING_MS} ago. A healthy review reaches a
+ * terminal state (the worker enforces its own timeout); a job lingering in a
+ * non-terminal state well past that bound means its worker died without
+ * flushing a terminal state, so callers should warn instead of implying it is
+ * still healthily in progress.
+ *
+ * @param {ReviewRecord | null | undefined} review
+ * @param {{ now?: number, staleMs?: number }} [options]
+ * @returns {boolean}
+ */
+export function isReviewLikelyStuck(review, options = {}) {
+  if (!review) {
+    return false;
+  }
+  if (review.status !== "running" && review.status !== "queued") {
+    return false;
+  }
+  const staleMs = options.staleMs ?? STALE_RUNNING_MS;
+  const now = options.now ?? Date.now();
+  const updatedAt = Date.parse(String(review.updatedAt ?? ""));
+  if (!Number.isFinite(updatedAt)) {
+    // No usable timestamp — treat as stuck so it is surfaced, not hidden.
+    return true;
+  }
+  return now - updatedAt > staleMs;
+}
+
+/**
+ * Completed reviews that carry a verdict but have not yet been surfaced into a
+ * Claude session, oldest first. The `UserPromptSubmit` hook injects these.
+ *
+ * @param {string} cwd
+ * @returns {ReviewRecord[]}
+ */
+export function getUnsurfacedCompletedReviews(cwd) {
+  return listReviews(cwd)
+    .filter(
+      (review) =>
+        review.status === "completed" &&
+        typeof review.verdict === "string" &&
+        review.verdict.trim() &&
+        !review.surfacedAt
+    )
+    .sort((left, right) =>
+      String(left.updatedAt ?? "").localeCompare(String(right.updatedAt ?? ""))
+    );
+}
+
+/**
+ * Mark a set of reviews as surfaced to a Claude session, so they are not
+ * re-injected on every later prompt. Stamps `surfacedAt` (and the session id
+ * for auditability). A single locked write covers all ids.
+ *
+ * @param {string} cwd
+ * @param {string[]} reviewIds
+ * @param {{ sessionId?: string | null }} [options]
+ */
+export function markReviewsSurfaced(cwd, reviewIds, options = {}) {
+  const ids = new Set(reviewIds);
+  if (ids.size === 0) {
+    return;
+  }
+  const surfacedAt = nowIso();
+  updateState(cwd, (state) => {
+    for (const review of state.reviews) {
+      if (ids.has(review.id) && !review.surfacedAt) {
+        review.surfacedAt = surfacedAt;
+        if (options.sessionId) {
+          review.surfacedSessionId = options.sessionId;
+        }
+      }
+    }
+  });
+}
+
+/**
+ * Session-end cleanup of the plugin's OWN state, in one locked pass:
+ *   - in-flight reviews (`queued`/`running`) belonging to `sessionId` are
+ *     reconciled to `failed` ("session ended"), so nothing is left dangling;
+ *   - reviews are pruned by age and count, but the most recent terminal review
+ *     is always kept so `/codex-autoreview:last` still works after a clear.
+ *
+ * Never touches `~/.codex` or anything outside the plugin's own state file.
+ *
+ * @param {string} cwd
+ * @param {{ sessionId?: string | null, now?: number, maxAgeMs?: number, keepRecent?: number }} [options]
+ * @returns {{ reconciled: number, pruned: number, kept: number }}
+ */
+export function reconcileAndPruneReviews(cwd, options = {}) {
+  const sessionId = options.sessionId ?? null;
+  const now = options.now ?? Date.now();
+  const maxAgeMs = options.maxAgeMs ?? 24 * 60 * 60 * 1000;
+  const keepRecent = Math.max(1, options.keepRecent ?? 5);
+  let reconciled = 0;
+  let pruned = 0;
+  let kept = 0;
+
+  updateState(cwd, (state) => {
+    // 1. Reconcile this session's still-in-flight reviews to a terminal state.
+    for (const review of state.reviews) {
+      const belongsToSession =
+        sessionId &&
+        review.request &&
+        typeof review.request === "object" &&
+        review.request.sessionId === sessionId;
+      if (belongsToSession && (review.status === "queued" || review.status === "running")) {
+        review.status = "failed";
+        review.errorMessage =
+          review.errorMessage ||
+          "Claude session ended before this background review finished.";
+        review.updatedAt = nowIso();
+        reconciled += 1;
+      }
+    }
+
+    // 2. Prune by age + count, but always keep the most recent few terminal
+    //    reviews so `last` still has something to show after a clear.
+    const sorted = [...state.reviews].sort((left, right) =>
+      String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
+    );
+    /** @type {ReviewRecord[]} */
+    const survivors = [];
+    for (let index = 0; index < sorted.length; index += 1) {
+      const review = sorted[index];
+      const updatedAt = Date.parse(String(review.updatedAt ?? ""));
+      const tooOld = Number.isFinite(updatedAt) && now - updatedAt > maxAgeMs;
+      const overKeepBudget = index >= keepRecent;
+      if (index < keepRecent || (!tooOld && !overKeepBudget)) {
+        survivors.push(review);
+        kept += 1;
+      } else {
+        pruned += 1;
+      }
+    }
+    state.reviews = survivors;
+  });
+
+  return { reconciled, pruned, kept };
 }

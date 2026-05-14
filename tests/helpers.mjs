@@ -105,6 +105,43 @@ process.exit(0);
 }
 
 /**
+ * Install a fake `codex` that HANGS on `codex exec` — it answers `--version`
+ * normally, then on `exec` spawns a long-lived grandchild and waits on it
+ * forever, never writing the output file. Used to exercise the worker's hard
+ * timeout and process-tree kill. The grandchild writes its pid to `pidFile` so
+ * a test can assert the whole tree was reaped.
+ *
+ * @param {string} binDir
+ * @param {{ pidFile?: string }} [options]
+ */
+export function installHangingCodex(binDir, options = {}) {
+  const pidFile = options.pidFile ?? path.join(binDir, "grandchild.pid");
+  const codexPath = path.join(binDir, "codex");
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const argv = process.argv.slice(2);
+if (argv[0] === "--version") {
+  process.stdout.write("codex-cli 0.0.0-fake-hang\\n");
+  process.exit(0);
+}
+// codex exec: spawn a grandchild that sleeps "forever", record its pid, and
+// block on it. Never write the --output-last-message file.
+try { fs.readFileSync(0, "utf8"); } catch {}
+const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], {
+  stdio: "ignore"
+});
+try { fs.writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid), "utf8"); } catch {}
+process.stderr.write("OpenAI Codex (fake, hanging)\\n");
+// Block this process too, so the whole tree must be killed by the timeout.
+setInterval(() => {}, 1e9);
+`;
+  fs.writeFileSync(codexPath, script, "utf8");
+  fs.chmodSync(codexPath, 0o755);
+  return { pidFile };
+}
+
+/**
  * Build an environment with `binDir` prepended to PATH (so the fake codex wins).
  *
  * @param {string} binDir

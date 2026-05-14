@@ -13,14 +13,25 @@ import process from "node:process";
 
 import {
   CODEX_DEFAULT_LABEL,
+  DEFAULT_REVIEW_EFFORT,
+  DEFAULT_REVIEW_TIMEOUT_MS,
   VALID_REASONING_EFFORTS,
   getCodexAvailability,
+  hasEffortOverride,
   normalizeModel,
   normalizeReasoningEffort,
+  normalizeTimeoutMs,
   resolveReviewEffort,
-  resolveReviewModel
+  resolveReviewModel,
+  resolveReviewTimeoutMs
 } from "./lib/codex.mjs";
-import { getConfig, getLatestReview, setConfig } from "./lib/state.mjs";
+import {
+  STALE_RUNNING_MS,
+  getConfig,
+  getLatestReview,
+  isReviewLikelyStuck,
+  setConfig
+} from "./lib/state.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 /**
@@ -87,12 +98,19 @@ function buildConfigReport(workspaceRoot, actionsTaken) {
   const availability = getCodexAvailability(workspaceRoot);
   const model = resolveReviewModel(config);
   const effort = resolveReviewEffort(config);
+  const effortIsOverride = hasEffortOverride(config);
+  const timeoutMs = resolveReviewTimeoutMs(config);
+  const timeoutIsOverride =
+    typeof config.timeoutMs === "number" && Number.isFinite(config.timeoutMs) && config.timeoutMs > 0;
 
   const payload = {
     workspaceRoot,
     enabled: Boolean(config.enabled),
     model,
     effort,
+    effortIsDefault: !effortIsOverride,
+    timeoutMs,
+    timeoutIsDefault: !timeoutIsOverride,
     codexAvailable: availability.available,
     codexDetail: availability.detail,
     actionsTaken
@@ -108,7 +126,14 @@ function buildConfigReport(workspaceRoot, actionsTaken) {
   lines.push(`codex-autoreview for ${workspaceRoot}`);
   lines.push(`  status:  ${payload.enabled ? "ON" : "OFF"}`);
   lines.push(`  model:   ${model ?? `${CODEX_DEFAULT_LABEL} (from ~/.codex/config.toml)`}`);
-  lines.push(`  effort:  ${effort ?? `${CODEX_DEFAULT_LABEL} (from ~/.codex/config.toml)`}`);
+  lines.push(
+    `  effort:  ${effort}${
+      effortIsOverride ? "" : " (plugin default — independent of ~/.codex/config.toml)"
+    }`
+  );
+  lines.push(
+    `  timeout: ${Math.round(timeoutMs / 1000)}s${timeoutIsOverride ? "" : " (default)"}`
+  );
   lines.push(
     `  codex:   ${availability.available ? `available — ${availability.detail}` : `NOT available — ${availability.detail}`}`
   );
@@ -130,7 +155,7 @@ function buildConfigReport(workspaceRoot, actionsTaken) {
  */
 function handleConfig(argv) {
   const { options } = parseArgs(argv, {
-    valueFlags: ["cwd", "model", "effort"],
+    valueFlags: ["cwd", "model", "effort", "timeout"],
     boolFlags: ["json", "enable", "disable"]
   });
 
@@ -165,7 +190,19 @@ function handleConfig(argv) {
     actionsTaken.push(
       effort
         ? `Set the Codex review reasoning effort to ${effort}.`
-        : `Cleared the effort override (codex will use its own config default).`
+        : `Cleared the effort override (back to the plugin default, ${DEFAULT_REVIEW_EFFORT}).`
+    );
+  }
+
+  if (options.timeout != null) {
+    const timeoutMs = normalizeTimeoutMs(options.timeout);
+    setConfig(workspaceRoot, "timeoutMs", timeoutMs);
+    actionsTaken.push(
+      timeoutMs
+        ? `Set the per-review codex timeout to ${Math.round(timeoutMs / 1000)}s (${timeoutMs} ms).`
+        : `Cleared the timeout override (back to the plugin default, ${Math.round(
+            DEFAULT_REVIEW_TIMEOUT_MS / 1000
+          )}s).`
     );
   }
 
@@ -196,14 +233,16 @@ function handleLast(argv) {
     return;
   }
 
+  const likelyStuck = isReviewLikelyStuck(review);
+
   if (options.json) {
-    output({ review, workspaceRoot }, true);
+    output({ review, workspaceRoot, likelyStuck }, true);
     return;
   }
 
   const lines = [];
   lines.push(`Last Codex ${review.kind} review (${review.id})`);
-  lines.push(`  status:    ${review.status}`);
+  lines.push(`  status:    ${review.status}${likelyStuck ? " (LIKELY STUCK)" : ""}`);
   lines.push(`  updated:   ${review.updatedAt}`);
   if (review.verdict) {
     lines.push(`  verdict:   ${review.verdict}`);
@@ -212,7 +251,14 @@ function handleLast(argv) {
     lines.push(`  error:     ${review.errorMessage}`);
   }
   lines.push("");
-  if (review.output) {
+  if (likelyStuck) {
+    const staleMin = Math.round(STALE_RUNNING_MS / 60000);
+    lines.push(
+      `This review has been "${review.status}" for over ${staleMin} minutes — its background ` +
+        "worker has most likely died without recording a result. It is not healthily in " +
+        "progress. Re-run the action to dispatch a fresh review."
+    );
+  } else if (review.output) {
     lines.push("--- Codex output ---");
     lines.push(review.output);
   } else if (review.status === "queued" || review.status === "running") {
@@ -228,7 +274,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-autoreview.mjs config [--enable|--disable] [--model <model>] " +
-        `[--effort <${VALID_REASONING_EFFORTS.join("|")}>] [--cwd <dir>] [--json]`,
+        `[--effort <${VALID_REASONING_EFFORTS.join("|")}>] [--timeout <ms>] [--cwd <dir>] [--json]`,
+      `    (effort defaults to ${DEFAULT_REVIEW_EFFORT}; timeout defaults to ` +
+        `${Math.round(DEFAULT_REVIEW_TIMEOUT_MS / 1000)}s — both independent of ~/.codex/config.toml)`,
       "  node scripts/codex-autoreview.mjs last [plan|code] [--kind <plan|code>] [--cwd <dir>] [--json]"
     ].join("\n")
   );

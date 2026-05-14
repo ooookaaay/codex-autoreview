@@ -1,7 +1,7 @@
 {
   "name": "codex-autoreview",
-  "version": "0.1.0",
-  "description": "Automatically sends Claude's plans and code changes to the Codex CLI for background devil's-advocate and bug-finding reviews.",
+  "version": "0.2.0",
+  "description": "Automatically sends Claude's plans and code changes to the Codex CLI for background devil's-advocate and bug-finding reviews, surfaces the verdicts back into the session, and cleans up after itself.",
   "author": {
     "name": "codex-autoreview contributors"
   },

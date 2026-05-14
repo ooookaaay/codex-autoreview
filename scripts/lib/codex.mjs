@@ -19,7 +19,7 @@
 import process from "node:process";
 import { spawn } from "node:child_process";
 
-import { binaryAvailable, runCommand } from "./process.mjs";
+import { binaryAvailable } from "./process.mjs";
 
 /**
  * Label shown for the model/effort when the project has not set an override.
@@ -47,6 +47,38 @@ export const VALID_REASONING_EFFORTS = Object.freeze([
 ]);
 
 /**
+ * The plugin's OWN default reasoning effort for automatic reviews.
+ *
+ * This is deliberately explicit and NOT inherited from the user's global
+ * `~/.codex/config.toml`: a user may keep their global default at `xhigh` for
+ * interactive use, which would make every automatic background review needlessly
+ * slow. `medium` keeps reviews fast to turn around while still leaving Codex
+ * enough reasoning budget to trace cross-file logic and catch real bugs (the
+ * value recommended by Codex itself for this background-review use case). Fully
+ * overridable per project via `/codex-autoreview:config --effort <e>`.
+ *
+ * Note the asymmetry with the model default: the MODEL stays unset/inherited on
+ * purpose (a hardcoded model can be rejected outright by ChatGPT-auth accounts),
+ * but EFFORT is safe to pin because every account accepts every effort tier.
+ */
+export const DEFAULT_REVIEW_EFFORT = "medium";
+
+/**
+ * Hard wall-clock cap for a single `codex exec` review run, in milliseconds.
+ * A hung or pathologically slow Codex must never leave a review job stuck in
+ * `running` forever — when this elapses the worker kills the codex process tree
+ * and marks the job `failed`. Overridable per project via the `timeoutMs`
+ * config key. 4 minutes is comfortably longer than a normal review (observed
+ * ~3-5 min) while still bounding a true hang.
+ */
+export const DEFAULT_REVIEW_TIMEOUT_MS = 240_000;
+
+/** Lower bound for a configured timeout — anything shorter is unusable. */
+const MIN_REVIEW_TIMEOUT_MS = 10_000;
+/** Upper bound for a configured timeout — guards against a typo'd huge value. */
+const MAX_REVIEW_TIMEOUT_MS = 1_800_000;
+
+/**
  * Resolve the Codex model override, or `null` when none is configured (meaning
  * "let codex use its own config default").
  *
@@ -60,16 +92,82 @@ export function resolveReviewModel(config) {
 }
 
 /**
- * Resolve the Codex reasoning-effort override, or `null` when none is configured
- * (meaning "let codex use its own config default").
+ * Resolve the effective Codex reasoning effort for a review.
+ *
+ * Unlike the model, effort always resolves to a concrete value: a configured
+ * override when set, otherwise the plugin's own {@link DEFAULT_REVIEW_EFFORT}.
+ * It is intentionally NOT left unset — leaving it unset would inherit the user's
+ * global `~/.codex/config.toml` (often `xhigh`), making automatic reviews slow.
  *
  * @param {{ effort?: unknown }} config
- * @returns {string | null}
+ * @returns {string}
  */
 export function resolveReviewEffort(config) {
   const configured =
     config && typeof config.effort === "string" ? config.effort.trim() : "";
-  return configured || null;
+  return configured || DEFAULT_REVIEW_EFFORT;
+}
+
+/**
+ * Whether the project has an explicit effort override, as opposed to falling
+ * back to {@link DEFAULT_REVIEW_EFFORT}. Used by the config report / statusline
+ * to label the source of the effort value.
+ *
+ * @param {{ effort?: unknown }} config
+ * @returns {boolean}
+ */
+export function hasEffortOverride(config) {
+  return Boolean(config && typeof config.effort === "string" && config.effort.trim());
+}
+
+/**
+ * Resolve the effective per-review timeout in milliseconds. Falls back to
+ * {@link DEFAULT_REVIEW_TIMEOUT_MS} when the project has not configured one.
+ *
+ * @param {{ timeoutMs?: unknown }} config
+ * @returns {number}
+ */
+export function resolveReviewTimeoutMs(config) {
+  const configured =
+    config && typeof config.timeoutMs === "number" && Number.isFinite(config.timeoutMs)
+      ? config.timeoutMs
+      : null;
+  if (configured == null || configured <= 0) {
+    return DEFAULT_REVIEW_TIMEOUT_MS;
+  }
+  return Math.min(Math.max(configured, MIN_REVIEW_TIMEOUT_MS), MAX_REVIEW_TIMEOUT_MS);
+}
+
+/**
+ * Normalize and validate a requested review timeout. Accepts a number of
+ * milliseconds or a numeric string; returns `null` for empty input (meaning
+ * "clear the override, use the default"); throws on a non-numeric or
+ * out-of-range value.
+ *
+ * @param {unknown} timeout
+ * @returns {number | null}
+ */
+export function normalizeTimeoutMs(timeout) {
+  if (timeout == null) {
+    return null;
+  }
+  const raw = String(timeout).trim();
+  if (!raw) {
+    return null;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(
+      `Invalid timeout "${timeout}". Pass a positive number of milliseconds ` +
+        `(${MIN_REVIEW_TIMEOUT_MS}-${MAX_REVIEW_TIMEOUT_MS}).`
+    );
+  }
+  if (value < MIN_REVIEW_TIMEOUT_MS || value > MAX_REVIEW_TIMEOUT_MS) {
+    throw new Error(
+      `Timeout ${value}ms is out of range. Use ${MIN_REVIEW_TIMEOUT_MS}-${MAX_REVIEW_TIMEOUT_MS} ms.`
+    );
+  }
+  return Math.round(value);
 }
 
 /**
@@ -160,14 +258,47 @@ export function buildCodexExecArgs(params) {
 }
 
 /**
- * Run `codex exec` synchronously with the review prompt on stdin and return the
- * captured final message. Used by the detached background worker — never by a
- * hook directly, because it blocks until Codex finishes.
+ * Best-effort kill of a process and everything it spawned.
+ *
+ * The child is started with `detached: true`, so it leads its own process
+ * group; `process.kill(-pid, signal)` then signals the whole group — important
+ * because `codex` itself spawns a vendored sub-binary that would otherwise
+ * survive a kill of just the direct child.
+ *
+ * @param {number | undefined} pid
+ * @param {NodeJS.Signals} signal
+ */
+function killProcessTree(pid, signal) {
+  if (!pid) {
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // The group may already be gone; fall back to the direct child.
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Already dead — nothing to do.
+    }
+  }
+}
+
+/**
+ * Run `codex exec` with the review prompt on stdin and resolve with the
+ * captured streams + exit status. Used by the detached background worker —
+ * never by a hook directly, because it blocks until Codex finishes (or the
+ * timeout fires).
+ *
+ * HANG PROTECTION: the codex child is spawned `detached` (its own process
+ * group) and a hard `timeoutMs` wall-clock cap is enforced. On timeout the
+ * whole process group is killed (SIGTERM, then SIGKILL after a short grace
+ * period) and the result is flagged `timedOut: true` so the worker can mark the
+ * job `failed` instead of leaving it stuck in `running` forever.
  *
  * The authoritative verdict text is the `--output-last-message` file, which the
  * caller reads. `codex exec` prints its session transcript to stderr (banner,
- * `ERROR: {...}` lines, etc.); stdout is typically empty. This function surfaces
- * both streams plus the exit status so the worker can decide success/failure.
+ * `ERROR: {...}` lines, etc.); stdout is typically empty.
  *
  * @param {object} params
  * @param {string} params.cwd
@@ -175,8 +306,9 @@ export function buildCodexExecArgs(params) {
  * @param {string | null} [params.model]
  * @param {string | null} [params.effort]
  * @param {string} params.outputFile
+ * @param {number} [params.timeoutMs] - Hard cap; defaults to {@link DEFAULT_REVIEW_TIMEOUT_MS}.
  * @param {NodeJS.ProcessEnv} [params.env]
- * @returns {{ status: number, stdout: string, stderr: string, signal: string | null, error: Error | null }}
+ * @returns {Promise<{ status: number, stdout: string, stderr: string, signal: string | null, error: Error | null, timedOut: boolean, timeoutMs: number }>}
  */
 export function runCodexReview(params) {
   const args = buildCodexExecArgs({
@@ -185,21 +317,102 @@ export function runCodexReview(params) {
     cwd: params.cwd,
     outputFile: params.outputFile
   });
+  const timeoutMs =
+    typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs) && params.timeoutMs > 0
+      ? params.timeoutMs
+      : DEFAULT_REVIEW_TIMEOUT_MS;
+  /** Grace period between SIGTERM and the follow-up SIGKILL. */
+  const KILL_GRACE_MS = 5_000;
 
-  const result = runCommand("codex", args, {
-    cwd: params.cwd,
-    env: params.env ?? process.env,
-    input: params.prompt,
-    maxBuffer: 32 * 1024 * 1024
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn("codex", args, {
+        cwd: params.cwd,
+        env: params.env ?? process.env,
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true
+      });
+    } catch (error) {
+      resolve({
+        status: 1,
+        stdout: "",
+        stderr: "",
+        signal: null,
+        error: error instanceof Error ? error : new Error(String(error)),
+        timedOut: false,
+        timeoutMs
+      });
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let spawnError = null;
+    let settled = false;
+    /** @type {NodeJS.Timeout | null} */
+    let killTimer = null;
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    // Hard wall-clock timeout: escalate SIGTERM -> SIGKILL across the group.
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child.pid, "SIGTERM");
+      killTimer = setTimeout(() => {
+        killProcessTree(child.pid, "SIGKILL");
+      }, KILL_GRACE_MS);
+      if (killTimer.unref) {
+        killTimer.unref();
+      }
+    }, timeoutMs);
+    if (timeoutTimer.unref) {
+      timeoutTimer.unref();
+    }
+
+    const finish = (status, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutTimer);
+      if (killTimer) {
+        clearTimeout(killTimer);
+      }
+      resolve({
+        status: status ?? (signal ? 1 : 0),
+        stdout,
+        stderr,
+        signal: signal ?? null,
+        error: spawnError,
+        timedOut,
+        timeoutMs
+      });
+    };
+
+    child.on("error", (error) => {
+      spawnError = error instanceof Error ? error : new Error(String(error));
+      finish(1, null);
+    });
+    child.on("close", (code, signal) => {
+      finish(code ?? 0, signal ?? null);
+    });
+
+    // Feed the prompt on stdin; ignore EPIPE if codex exits early.
+    try {
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(params.prompt ?? "");
+    } catch {
+      // stdin already closed — codex will run with whatever it received.
+    }
   });
-
-  return {
-    status: result.status,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    signal: result.signal,
-    error: result.error
-  };
 }
 
 /**

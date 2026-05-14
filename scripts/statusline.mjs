@@ -81,8 +81,11 @@ export function buildStatuslineSegment(cwd) {
     return "";
   }
 
+  // Model may be unset (inherited from ~/.codex/config.toml) — show the
+  // default label. Effort always resolves to a concrete value: an explicit
+  // override or the plugin's own default (medium).
   const model = resolveReviewModel(config) ?? CODEX_DEFAULT_LABEL;
-  const effort = resolveReviewEffort(config) ?? CODEX_DEFAULT_LABEL;
+  const effort = resolveReviewEffort(config);
   return `codex-autoreview: ON (${model}, ${effort})`;
 }
 
