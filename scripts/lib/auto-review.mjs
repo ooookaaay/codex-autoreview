@@ -17,7 +17,12 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { resolveReviewEffort, resolveReviewModel, spawnDetached } from "./codex.mjs";
-import { generateReviewId, resolveReviewLogFile, upsertReview } from "./state.mjs";
+import {
+  generateReviewId,
+  resolveReviewLogFile,
+  updateReviewIf,
+  upsertReview
+} from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const LIB_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -85,7 +90,16 @@ export function dispatchBackgroundReview(params) {
       [WORKER_SCRIPT, "--cwd", cwd, "--review-id", reviewId],
       { cwd, env: childEnv }
     );
-    upsertReview(workspaceRoot, { id: reviewId, status: "queued", pid: pid ?? null });
+    // Attach the worker pid, but only while the review is still `queued`. By the
+    // time this runs the detached worker may already have advanced the status to
+    // `running`/`completed`/`failed`; a conditional patch makes this a
+    // compare-and-set so it can never roll a finished review back to `queued`.
+    updateReviewIf(
+      workspaceRoot,
+      reviewId,
+      (review) => review.status === "queued",
+      { pid: pid ?? null }
+    );
     return { dispatched: true, reviewId, detail: null };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

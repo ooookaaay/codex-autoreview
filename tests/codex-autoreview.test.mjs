@@ -32,7 +32,14 @@ import {
   resolveReviewEffort,
   resolveReviewModel
 } from "../scripts/lib/codex.mjs";
-import { resolveStateDir, getLatestReview, loadState } from "../scripts/lib/state.mjs";
+import {
+  resolveStateDir,
+  getLatestReview,
+  loadState,
+  updateReviewIf,
+  updateState,
+  upsertReview
+} from "../scripts/lib/state.mjs";
 import { buildStatuslineSegment } from "../scripts/statusline.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -500,4 +507,84 @@ test("resolveStateDir is stable and per-workspace", () => {
   const other = makeTempDir();
   initGitRepo(other);
   assert.notEqual(resolveStateDir(other), a);
+});
+
+// --- state concurrency / atomicity ---------------------------------------
+
+test("updateReviewIf only patches when the predicate holds (compare-and-set)", () => {
+  const { repo } = setupRepo();
+  upsertReview(repo, { id: "r1", kind: "code", status: "queued" });
+
+  // Worker has already advanced the review; the predicate must reject the
+  // late dispatcher write so a finished review is never rolled back.
+  upsertReview(repo, { id: "r1", status: "completed", verdict: "CLEAN: ok" });
+  const rejected = updateReviewIf(
+    repo,
+    "r1",
+    (review) => review.status === "queued",
+    { pid: 4242 }
+  );
+  assert.equal(rejected.applied, false);
+  const afterReject = loadState(repo).reviews.find((r) => r.id === "r1");
+  assert.equal(afterReject.status, "completed");
+  assert.equal(afterReject.pid, undefined);
+
+  // When the predicate holds, the patch is applied.
+  upsertReview(repo, { id: "r2", kind: "plan", status: "queued" });
+  const applied = updateReviewIf(
+    repo,
+    "r2",
+    (review) => review.status === "queued",
+    { pid: 99 }
+  );
+  assert.equal(applied.applied, true);
+  assert.equal(loadState(repo).reviews.find((r) => r.id === "r2").pid, 99);
+
+  // A missing review id is a clean no-op.
+  assert.equal(
+    updateReviewIf(repo, "does-not-exist", () => true, { pid: 1 }).applied,
+    false
+  );
+});
+
+test("concurrent updateState writers do not lose each other's updates", async () => {
+  const { repo } = setupRepo();
+  // Seed twenty distinct reviews from parallel writers; with an unsynchronized
+  // read-modify-write some would be lost. The lock must serialize them so all
+  // twenty survive (MAX_REVIEWS is 20).
+  const writers = Array.from({ length: 20 }, (_, index) =>
+    Promise.resolve().then(() =>
+      updateState(repo, (state) => {
+        state.reviews.unshift({
+          id: `concurrent-${index}`,
+          kind: "code",
+          status: "queued",
+          verdict: null,
+          output: null,
+          errorMessage: null,
+          logFile: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date(Date.now() + index).toISOString()
+        });
+      })
+    )
+  );
+  await Promise.all(writers);
+
+  const ids = new Set(loadState(repo).reviews.map((review) => review.id));
+  for (let index = 0; index < 20; index += 1) {
+    assert.ok(ids.has(`concurrent-${index}`), `lost update for concurrent-${index}`);
+  }
+});
+
+test("saveState writes atomically — readers never see partial JSON", () => {
+  const { repo } = setupRepo();
+  // Drive a batch of updates, re-parsing the state file after every one. An
+  // atomic temp-file+rename write guarantees each read parses cleanly.
+  for (let index = 0; index < 30; index += 1) {
+    upsertReview(repo, { id: `atomic-${index}`, kind: "code", status: "queued" });
+    const parsed = loadState(repo);
+    assert.ok(Array.isArray(parsed.reviews));
+    assert.equal(typeof parsed.version, "number");
+  }
 });

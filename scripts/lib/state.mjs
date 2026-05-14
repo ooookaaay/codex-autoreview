@@ -23,6 +23,13 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-autoreview");
 const STATE_FILE_NAME = "state.json";
 const REVIEWS_DIR_NAME = "reviews";
 const MAX_REVIEWS = 20;
+const LOCK_FILE_NAME = "state.json.lock";
+/** Treat a lock older than this as stale (a crashed writer never released it). */
+const LOCK_STALE_MS = 15_000;
+/** How long to keep retrying to acquire the lock before giving up. */
+const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
+/** Busy-wait granularity between lock acquisition attempts. */
+const LOCK_RETRY_MS = 25;
 
 /**
  * @typedef {object} AutoReviewConfig
@@ -108,6 +115,94 @@ export function resolveReviewsDir(cwd) {
 
 /**
  * @param {string} cwd
+ * @returns {string}
+ */
+function resolveLockFile(cwd) {
+  return path.join(resolveStateDir(cwd), LOCK_FILE_NAME);
+}
+
+/**
+ * Sleep synchronously for `ms` without a busy CPU spin. The state writers are
+ * short-lived processes (hooks and a detached worker), so a blocking wait on
+ * the order of milliseconds is acceptable and keeps the locking logic simple.
+ *
+ * @param {number} ms
+ */
+function sleepSync(ms) {
+  if (ms <= 0) {
+    return;
+  }
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
+/**
+ * Run `fn` while holding an exclusive per-workspace lock so concurrent hook
+ * processes and the detached review worker cannot interleave their
+ * read-modify-write cycles on the shared state file.
+ *
+ * The lock is an `O_EXCL` lock file. A lock older than {@link LOCK_STALE_MS} is
+ * treated as abandoned by a crashed writer and forcibly broken. If the lock
+ * cannot be acquired within {@link LOCK_ACQUIRE_TIMEOUT_MS}, `fn` is run anyway
+ * (an unsynchronized write is strictly better than dropping the update).
+ *
+ * @template T
+ * @param {string} cwd
+ * @param {() => T} fn
+ * @returns {T}
+ */
+function withStateLock(cwd, fn) {
+  ensureStateDir(cwd);
+  const lockFile = resolveLockFile(cwd);
+  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  let acquired = false;
+
+  while (!acquired) {
+    try {
+      const fd = fs.openSync(lockFile, "wx");
+      fs.writeSync(fd, `${process.pid}\n`);
+      fs.closeSync(fd);
+      acquired = true;
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code !== "EEXIST") {
+        // Cannot even create the lock file (e.g. permissions): proceed unlocked
+        // rather than lose the update entirely.
+        break;
+      }
+      // Break a stale lock left behind by a crashed writer.
+      try {
+        const age = Date.now() - fs.statSync(lockFile).mtimeMs;
+        if (age > LOCK_STALE_MS) {
+          fs.rmSync(lockFile, { force: true });
+          continue;
+        }
+      } catch {
+        // The lock vanished between calls — just retry.
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        // Give up waiting and proceed unlocked rather than drop the update.
+        break;
+      }
+      sleepSync(LOCK_RETRY_MS);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    if (acquired) {
+      try {
+        fs.rmSync(lockFile, { force: true });
+      } catch {
+        // Best-effort release; a leftover lock will be broken as stale.
+      }
+    }
+  }
+}
+
+/**
+ * @param {string} cwd
  */
 export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveReviewsDir(cwd), { recursive: true });
@@ -167,6 +262,10 @@ function pruneReviews(reviews) {
 /**
  * Persist `state` for `cwd`. Prunes the review buffer to `MAX_REVIEWS`.
  *
+ * The write is atomic: the JSON is written to a unique temp file and then
+ * `rename`d over the real state file, so a concurrent reader never observes a
+ * truncated or partially written file.
+ *
  * @param {string} cwd
  * @param {{ config?: Partial<AutoReviewConfig>, reviews?: ReviewRecord[] }} state
  * @returns {{ version: number, config: AutoReviewConfig, reviews: ReviewRecord[] }}
@@ -181,25 +280,37 @@ export function saveState(cwd, state) {
     },
     reviews: pruneReviews(state.reviews ?? [])
   };
-  fs.writeFileSync(
-    resolveStateFile(cwd),
-    `${JSON.stringify(nextState, null, 2)}\n`,
-    "utf8"
-  );
+  const stateFile = resolveStateFile(cwd);
+  const tempFile = `${stateFile}.${process.pid}.${Date.now().toString(36)}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+    fs.renameSync(tempFile, stateFile);
+  } catch (error) {
+    try {
+      fs.rmSync(tempFile, { force: true });
+    } catch {
+      // Best-effort temp cleanup; ignore.
+    }
+    throw error;
+  }
   return nextState;
 }
 
 /**
- * Load the state, apply `mutate`, and persist the result.
+ * Load the state, apply `mutate`, and persist the result. The whole
+ * load-mutate-save cycle runs under an exclusive per-workspace lock so
+ * concurrent hooks and the detached worker cannot lose each other's updates.
  *
  * @param {string} cwd
  * @param {(state: { version: number, config: AutoReviewConfig, reviews: ReviewRecord[] }) => void} mutate
  * @returns {{ version: number, config: AutoReviewConfig, reviews: ReviewRecord[] }}
  */
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveState(cwd, state);
+  });
 }
 
 /**
@@ -275,6 +386,42 @@ export function upsertReview(cwd, patch) {
       updatedAt: timestamp
     };
   });
+}
+
+/**
+ * Conditionally patch an existing review: the `patch` is applied only if the
+ * current record satisfies `predicate`. The predicate test and the write happen
+ * inside the same locked critical section, so this is a true compare-and-set —
+ * it cannot roll back a status the detached worker has already advanced.
+ *
+ * Used by the dispatcher to attach the worker `pid` after spawning without
+ * clobbering a worker that has already moved the review past `queued`.
+ *
+ * @param {string} cwd
+ * @param {string} id - Review id to patch.
+ * @param {(review: ReviewRecord) => boolean} predicate
+ * @param {Partial<ReviewRecord>} patch
+ * @returns {{ applied: boolean }}
+ */
+export function updateReviewIf(cwd, id, predicate, patch) {
+  let applied = false;
+  updateState(cwd, (state) => {
+    const index = state.reviews.findIndex((review) => review.id === id);
+    if (index === -1) {
+      return;
+    }
+    if (!predicate(state.reviews[index])) {
+      return;
+    }
+    state.reviews[index] = {
+      ...state.reviews[index],
+      ...patch,
+      id,
+      updatedAt: nowIso()
+    };
+    applied = true;
+  });
+  return { applied };
 }
 
 /**
