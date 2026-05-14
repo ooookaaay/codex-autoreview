@@ -967,7 +967,9 @@ test("review-worker reaches a terminal state when the codex CLI is absent", () =
   assert.notEqual(result.status, 0);
   const review = loadState(repo).reviews.find((r) => r.id === reviewId);
   assert.equal(review.status, "failed");
-  assert.match(review.errorMessage, /Codex CLI is not available/i);
+  // The worker now routes through the reviewer backend abstraction (F1): the
+  // default `exec-generic` backend's probe reports codex as unavailable.
+  assert.match(review.errorMessage, /backend "exec-generic" is not available/i);
 });
 
 test("review-worker reaches a terminal state when codex exec fails", () => {
