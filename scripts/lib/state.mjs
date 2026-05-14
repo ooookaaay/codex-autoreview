@@ -319,15 +319,43 @@ export function loadState(cwd) {
 }
 
 /**
+ * Trim the review ring buffer on every save.
+ *
+ * CRITICAL safety rule: a non-terminal (`queued`/`running`) review is NEVER
+ * dropped, however many there are. Its detached worker still expects to find
+ * its record — if the record vanished, the worker would find nothing, exit
+ * without writing a terminal state, and the verdict would be lost (breaking the
+ * terminal-state guarantee). Only TERMINAL reviews are subject to the
+ * {@link MAX_REVIEWS} cap; the newest terminal reviews are kept so
+ * `/codex-autoreview:last` still works.
+ *
  * @param {ReviewRecord[]} reviews
  * @returns {ReviewRecord[]}
  */
 function pruneReviews(reviews) {
-  return [...reviews]
-    .sort((left, right) =>
-      String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
-    )
-    .slice(0, MAX_REVIEWS);
+  const sorted = [...reviews].sort((left, right) =>
+    String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
+  );
+  /** @type {ReviewRecord[]} */
+  const nonTerminal = [];
+  /** @type {ReviewRecord[]} */
+  const terminal = [];
+  for (const review of sorted) {
+    if (review.status === "completed" || review.status === "failed") {
+      terminal.push(review);
+    } else {
+      nonTerminal.push(review);
+    }
+  }
+  // Keep every non-terminal review; cap only the terminal ones. The overall
+  // budget for terminal records shrinks by however many non-terminal reviews
+  // are in flight, but always leaves room for at least a few terminal records.
+  const terminalBudget = Math.max(5, MAX_REVIEWS - nonTerminal.length);
+  const keptTerminal = terminal.slice(0, terminalBudget);
+  // Re-sort the union newest-first so the buffer stays ordered.
+  return [...nonTerminal, ...keptTerminal].sort((left, right) =>
+    String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
+  );
 }
 
 /**

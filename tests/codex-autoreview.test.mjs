@@ -684,6 +684,51 @@ test("concurrent updateState writers do not lose each other's updates", async ()
   }
 });
 
+test("pruneReviews never drops a non-terminal review, even past MAX_REVIEWS", () => {
+  const { repo } = setupRepo();
+  // Seed 30 RUNNING reviews — well past the MAX_REVIEWS (20) ring-buffer cap.
+  // A naive prune would delete 10 of them; their detached workers would then
+  // find no record and exit without a terminal state, losing the verdict.
+  for (let index = 0; index < 30; index += 1) {
+    upsertReview(repo, {
+      id: `inflight-${index}`,
+      kind: "code",
+      status: "running",
+      request: { cwd: repo, prompt: "x" }
+    });
+  }
+  const afterInflight = loadState(repo).reviews;
+  for (let index = 0; index < 30; index += 1) {
+    assert.ok(
+      afterInflight.find((r) => r.id === `inflight-${index}`),
+      `non-terminal review inflight-${index} must NOT be pruned`
+    );
+  }
+
+  // Now add 30 terminal reviews — these ARE subject to the cap, but the 30
+  // running reviews must still all survive.
+  for (let index = 0; index < 30; index += 1) {
+    upsertReview(repo, {
+      id: `done-${index}`,
+      kind: "code",
+      status: "completed",
+      verdict: "CLEAN: ok"
+    });
+  }
+  const finalReviews = loadState(repo).reviews;
+  for (let index = 0; index < 30; index += 1) {
+    assert.ok(
+      finalReviews.find((r) => r.id === `inflight-${index}`),
+      `non-terminal review inflight-${index} must survive even with many terminal records`
+    );
+  }
+  // At least a few terminal records are kept (so `last` works), but they are
+  // capped — not all 30 survive.
+  const keptTerminal = finalReviews.filter((r) => r.status === "completed");
+  assert.ok(keptTerminal.length >= 5, "a few terminal reviews are kept for /last");
+  assert.ok(keptTerminal.length < 30, "terminal reviews ARE subject to the ring-buffer cap");
+});
+
 test("saveState writes atomically — readers never see partial JSON", () => {
   const { repo } = setupRepo();
   // Drive a batch of updates, re-parsing the state file after every one. An
