@@ -1557,6 +1557,64 @@ test("session-end hook self-heals a stuck review from ANOTHER session", () => {
   );
 });
 
+test("session-end hook's second pass kills a worker that raced past reconcile", async () => {
+  // A worker can record its pid + claim `running` AFTER the cleanup hook's
+  // first snapshot but BEFORE reconcile marks it failed. The post-reconcile
+  // second kill pass must still reap that worker's process tree.
+  const binDir = makeTempDir();
+  const { pidFile } = installHangingCodex(binDir);
+  const { repo } = setupRepo();
+  const { spawn } = await import("node:child_process");
+
+  const reviewId = seedQueuedReview(repo, {
+    timeoutMs: 120_000,
+    sessionId: "raced-sess"
+  });
+  const worker = spawn("node", [WORKER, "--cwd", repo, "--review-id", reviewId], {
+    env: buildEnv(binDir),
+    stdio: "ignore"
+  });
+  // Let the worker fully claim `running` and spawn its codex child.
+  await waitFor(
+    () =>
+      loadState(repo).reviews.find((r) => r.id === reviewId)?.status === "running" &&
+      fs.existsSync(pidFile),
+    { timeoutMs: 8000, intervalMs: 50 }
+  );
+  const grandchildPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+
+  // SessionEnd for this worker's session. By the time it runs, the review is
+  // already `running` with a pid — reconcile will mark it `failed`, and the
+  // second pass must still kill the (now `failed`) worker + its codex child.
+  const result = run("node", [SESSION_END_HOOK], {
+    input: JSON.stringify({ cwd: repo, session_id: "raced-sess" }),
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /killed 1 worker/i);
+
+  // The worker process and its codex grandchild must both be reaped.
+  const workerGone = await waitFor(
+    () => worker.exitCode !== null || worker.signalCode !== null,
+    { timeoutMs: 8000, intervalMs: 100 }
+  );
+  assert.ok(workerGone, "the raced worker must be killed by the second pass");
+  const codexGone = await waitFor(
+    () => {
+      try {
+        process.kill(grandchildPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    },
+    { timeoutMs: 8000, intervalMs: 100 }
+  );
+  assert.ok(codexGone, "the raced worker's codex child must be reaped too");
+  // The review record is terminal.
+  assert.equal(loadState(repo).reviews.find((r) => r.id === reviewId).status, "failed");
+});
+
 test("session-end hook never errors out, even with no state and no session id", () => {
   const repo = makeTempDir();
   initGitRepo(repo);

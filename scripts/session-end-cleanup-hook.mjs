@@ -128,11 +128,22 @@ function looksLikeReviewWorker(pid, reviewId) {
  * Kill the detached workers this session started. A worker started detached
  * leads its own process group, so signalling `-pid` reaps the codex child too.
  *
+ * `includeTerminal` is for the SECOND kill pass: by then `reconcileAndPruneReviews`
+ * has marked this session's in-flight reviews `failed`, but a worker that raced
+ * in (recorded its pid + claimed `running` between the first snapshot and the
+ * reconcile) is still alive. That pass must therefore also kill workers whose
+ * review record is now `failed` — the pid + review-id verification still
+ * guarantees only a genuine, matching review-worker is ever signalled.
+ *
  * @param {import("./lib/state.mjs").ReviewRecord[]} reviews
  * @param {string | null} sessionId
- * @returns {number} count of workers signalled
+ * @param {{ includeTerminal?: boolean, alreadyKilled?: Set<number> }} [options]
+ * @returns {{ killed: number, killedPids: Set<number> }}
  */
-function killSessionWorkers(reviews, sessionId) {
+function killSessionWorkers(reviews, sessionId, options = {}) {
+  const includeTerminal = Boolean(options.includeTerminal);
+  const alreadyKilled = options.alreadyKilled ?? new Set();
+  const killedPids = new Set(alreadyKilled);
   let killed = 0;
   for (const review of reviews) {
     const request = review.request;
@@ -141,14 +152,19 @@ function killSessionWorkers(reviews, sessionId) {
     if (!belongsToSession) {
       continue;
     }
-    if (review.status !== "queued" && review.status !== "running") {
+    const inFlight = review.status === "queued" || review.status === "running";
+    // First pass: in-flight only. Second pass: also `failed` (a raced worker
+    // whose review was reconciled while it was still spinning up).
+    if (!inFlight && !(includeTerminal && review.status === "failed")) {
       continue;
     }
     const pid = typeof review.pid === "number" && review.pid > 0 ? review.pid : null;
-    if (!pid || !looksLikeReviewWorker(pid, review.id)) {
-      // Either no pid recorded, the process is gone, or it could not be
-      // positively verified as this review's worker — skip the kill. The
-      // review is still reconciled to a terminal state below regardless.
+    if (!pid || killedPids.has(pid)) {
+      continue;
+    }
+    if (!looksLikeReviewWorker(pid, review.id)) {
+      // No verifiable matching review-worker at that pid — skip the kill. The
+      // review is reconciled to a terminal state regardless.
       continue;
     }
     try {
@@ -158,12 +174,13 @@ function killSessionWorkers(reviews, sessionId) {
       } catch {
         process.kill(pid, "SIGTERM");
       }
+      killedPids.add(pid);
       killed += 1;
     } catch {
       // Already gone — nothing to do.
     }
   }
-  return killed;
+  return { killed, killedPids };
 }
 
 /**
@@ -213,10 +230,10 @@ function main() {
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
 
-  // 1. Kill this session's orphaned detached workers (before reconciling state,
-  //    so a worker cannot race us back to `running`).
+  // 1. FIRST kill pass: kill this session's detached workers that are visible
+  //    as in-flight right now.
   const reviewsBefore = listReviews(workspaceRoot);
-  const killed = killSessionWorkers(reviewsBefore, sessionId);
+  const firstPass = killSessionWorkers(reviewsBefore, sessionId);
 
   // 2. Reconcile this session's in-flight reviews to terminal + prune old ones.
   //    Pruning only ever removes TERMINAL reviews; another active session's
@@ -227,7 +244,20 @@ function main() {
     { sessionId }
   );
 
-  // 3. Drop log/output files ONLY for the reviews that were explicitly pruned
+  // 3. SECOND kill pass, AFTER reconcile: a worker can race in between the
+  //    first snapshot and the reconcile — recording its pid and claiming
+  //    `running` — so it is now marked `failed` in state but its process (and
+  //    its codex child) is still alive. Re-read state and kill those too;
+  //    `includeTerminal` lets this pass act on the just-reconciled `failed`
+  //    records. pid + review-id verification still gates every signal.
+  const reviewsAfter = listReviews(workspaceRoot);
+  const secondPass = killSessionWorkers(reviewsAfter, sessionId, {
+    includeTerminal: true,
+    alreadyKilled: firstPass.killedPids
+  });
+  const killed = firstPass.killed + secondPass.killed;
+
+  // 4. Drop log/output files ONLY for the reviews that were explicitly pruned
   //    above — never for "anything not in current state", which would clobber
   //    another active session's still-running review files.
   const filesRemoved = removePrunedReviewFiles(workspaceRoot, prunedIds);
