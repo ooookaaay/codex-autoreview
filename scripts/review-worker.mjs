@@ -26,6 +26,7 @@ import process from "node:process";
 import {
   extractVerdictLine,
   getCodexAvailability,
+  killProcessTree,
   resolveReviewTimeoutMs,
   runCodexReview
 } from "./lib/codex.mjs";
@@ -116,7 +117,14 @@ const terminalState = {
   reviewId: null,
   /** @type {string | null} */
   logFile: null,
-  settled: false
+  settled: false,
+  /**
+   * Pid of the in-flight detached `codex exec` child, or null when none is
+   * running. The signal handlers reap this so killing the worker never orphans
+   * an expensive codex run.
+   * @type {number | undefined | null}
+   */
+  codexChildPid: null
 };
 
 /**
@@ -150,13 +158,26 @@ function settleTerminal(status, patch = {}) {
 
 /**
  * Install SIGTERM/SIGINT handlers so that even if this detached worker is
- * killed (host shutdown, manual kill, Claude Code reaping orphans) it flushes a
- * `failed` terminal state before exiting instead of leaving the review stuck.
+ * killed (host shutdown, manual kill, the SessionEnd cleanup hook reaping this
+ * session's workers) it:
+ *   1. kills the in-flight `codex exec` process tree, so an expensive codex run
+ *      is never orphaned to keep burning quota after the worker is gone; and
+ *   2. flushes a `failed` terminal state, so the review is never left stuck.
  */
 function installSignalHandlers() {
   for (const signal of /** @type {const} */ (["SIGTERM", "SIGINT"])) {
     process.on(signal, () => {
-      appendLog(terminalState.logFile ?? "", `Worker received ${signal}; marking review failed.`);
+      appendLog(
+        terminalState.logFile ?? "",
+        `Worker received ${signal}; killing codex child and marking review failed.`
+      );
+      // Reap the detached codex child tree first — it leads its own process
+      // group, so it would otherwise survive this worker exiting.
+      if (terminalState.codexChildPid) {
+        killProcessTree(terminalState.codexChildPid, "SIGTERM");
+        killProcessTree(terminalState.codexChildPid, "SIGKILL");
+        terminalState.codexChildPid = null;
+      }
       settleTerminal("failed", {
         errorMessage: `Review worker was terminated by ${signal} before it could finish.`
       });
@@ -236,7 +257,12 @@ async function main() {
       effort: request.effort,
       outputFile,
       timeoutMs,
-      env: process.env
+      env: process.env,
+      // Track the codex child pid so the signal handlers can reap its process
+      // tree if this worker is killed mid-run.
+      onChild: (pid) => {
+        terminalState.codexChildPid = pid ?? null;
+      }
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

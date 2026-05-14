@@ -265,10 +265,14 @@ export function buildCodexExecArgs(params) {
  * because `codex` itself spawns a vendored sub-binary that would otherwise
  * survive a kill of just the direct child.
  *
+ * Exported so the detached worker can reap an in-flight `codex exec` tree from
+ * its own SIGTERM/SIGINT handler — otherwise killing the worker would orphan
+ * the (expensive) codex run.
+ *
  * @param {number | undefined} pid
  * @param {NodeJS.Signals} signal
  */
-function killProcessTree(pid, signal) {
+export function killProcessTree(pid, signal) {
   if (!pid) {
     return;
   }
@@ -308,6 +312,10 @@ function killProcessTree(pid, signal) {
  * @param {string} params.outputFile
  * @param {number} [params.timeoutMs] - Hard cap; defaults to {@link DEFAULT_REVIEW_TIMEOUT_MS}.
  * @param {NodeJS.ProcessEnv} [params.env]
+ * @param {(pid: number | undefined) => void} [params.onChild] - Invoked once
+ *   with the spawned codex child pid (and again with `undefined` when it
+ *   exits). Lets the caller reap the codex process tree if the caller itself is
+ *   killed mid-run, so an in-flight codex exec is never orphaned.
  * @returns {Promise<{ status: number, stdout: string, stderr: string, signal: string | null, error: Error | null, timedOut: boolean, timeoutMs: number }>}
  */
 export function runCodexReview(params) {
@@ -323,6 +331,8 @@ export function runCodexReview(params) {
       : DEFAULT_REVIEW_TIMEOUT_MS;
   /** Grace period between SIGTERM and the follow-up SIGKILL. */
   const KILL_GRACE_MS = 5_000;
+
+  const onChild = typeof params.onChild === "function" ? params.onChild : null;
 
   return new Promise((resolve) => {
     let child;
@@ -345,6 +355,16 @@ export function runCodexReview(params) {
         timeoutMs
       });
       return;
+    }
+
+    // Hand the caller the codex child pid so it can reap the process tree if
+    // the caller is itself killed mid-run.
+    if (onChild) {
+      try {
+        onChild(child.pid);
+      } catch {
+        // A bad callback must not break the review run.
+      }
     }
 
     let stdout = "";
@@ -385,6 +405,14 @@ export function runCodexReview(params) {
       clearTimeout(timeoutTimer);
       if (killTimer) {
         clearTimeout(killTimer);
+      }
+      // The codex child is gone — tell the caller so it stops tracking it.
+      if (onChild) {
+        try {
+          onChild(undefined);
+        } catch {
+          // ignore
+        }
       }
       resolve({
         status: status ?? (signal ? 1 : 0),

@@ -804,10 +804,12 @@ test("review-worker reaches a terminal state when codex exec fails", () => {
   assert.ok(review.errorMessage, "a failed review must carry an error message");
 });
 
-test("review-worker flushes a 'failed' terminal state when killed by SIGTERM", async () => {
+test("review-worker, killed by SIGTERM, flushes 'failed' AND reaps the codex tree", async () => {
   const binDir = makeTempDir();
-  // A codex that hangs long enough for us to SIGTERM the worker mid-run.
-  installHangingCodex(binDir);
+  // A codex that hangs long enough for us to SIGTERM the worker mid-run. The
+  // fake records its grandchild pid so we can assert the whole codex tree was
+  // reaped — not orphaned — when the worker is killed.
+  const { pidFile } = installHangingCodex(binDir);
   const repo = makeTempDir();
   initGitRepo(repo);
   // Long timeout so the worker is still in `running` when we kill it.
@@ -819,11 +821,15 @@ test("review-worker flushes a 'failed' terminal state when killed by SIGTERM", a
     stdio: "ignore"
   });
 
-  // Wait until the worker has flipped the review to `running`, then SIGTERM it.
+  // Wait until the worker has flipped the review to `running` AND the fake
+  // codex has spawned its grandchild, then SIGTERM the worker.
   await waitFor(
-    () => loadState(repo).reviews.find((r) => r.id === reviewId)?.status === "running",
+    () =>
+      loadState(repo).reviews.find((r) => r.id === reviewId)?.status === "running" &&
+      fs.existsSync(pidFile),
     { timeoutMs: 8000, intervalMs: 100 }
   );
+  const grandchildPid = Number(fs.readFileSync(pidFile, "utf8").trim());
   worker.kill("SIGTERM");
   await waitFor(() => worker.exitCode !== null || worker.signalCode !== null, {
     timeoutMs: 8000,
@@ -837,6 +843,21 @@ test("review-worker flushes a 'failed' terminal state when killed by SIGTERM", a
     "a SIGTERM'd worker must flush 'failed', never leave the review 'running'"
   );
   assert.match(review.errorMessage, /terminated by SIGTERM/i);
+
+  // The codex grandchild must have been killed with the tree — a SIGTERM'd
+  // worker must never orphan an in-flight codex run.
+  const codexReaped = await waitFor(
+    () => {
+      try {
+        process.kill(grandchildPid, 0);
+        return false; // still alive
+      } catch {
+        return true; // gone
+      }
+    },
+    { timeoutMs: 8000, intervalMs: 100 }
+  );
+  assert.ok(codexReaped, `codex grandchild ${grandchildPid} must be reaped, not orphaned`);
 });
 
 test("isReviewLikelyStuck flags non-terminal reviews past the stale bound", () => {
