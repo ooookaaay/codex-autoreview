@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.1
+
+Security & concurrency hardening — from a full Codex code review of the
+codebase plus a defense-in-depth pass on the process-kill paths.
+
+- **Command injection (HIGH)** — the `config` / `last` / `doctor` / `onboard`
+  slash-command files interpolated raw `$ARGUMENTS` into a `!`-prefixed shell
+  snippet. Restructured to the safe pattern: Claude reads the arguments and
+  invokes the CLI via the Bash tool with explicit, validated arguments — no
+  raw shell interpolation.
+- **Arbitrary file read (HIGH)** — the plan-review hook trusted
+  `tool_input.planFilePath` and read it directly. It is now validated — the
+  resolved real path must stay inside the workspace, size-capped, symlink-safe
+  — and the hook no-ops cleanly on a bad path.
+- **External-backend gating** — the automatic hooks required the Codex CLI
+  even when the project is configured with an `external` reviewer backend.
+  They now only treat Codex as required for the backends that actually use it.
+- **Dedup race** — review deduplication was a read-then-insert outside the
+  state lock, so two hooks for the same input could both insert + spawn a
+  worker. The duplicate check and the insert now run in one locked
+  compare-and-set.
+- **Stale-lock safety** — a stale state-lock is now broken only when its owner
+  pid is verifiably dead (`process.kill(pid, 0)`), not on age alone — a slow
+  live writer can no longer have its lock stolen.
+- **Diff fingerprint** — the review anchor now folds in untracked file
+  *contents* (bounded: 256 KiB/file, 200-file cap, binary-aware), not just
+  their paths, so editing an untracked file is no longer missed by dedup and
+  stale detection.
+- **Kill-path safety** — every `process.kill(-pid)` site now rejects
+  `pid <= 1`, making an accidental `kill(-1)` process-group broadcast
+  structurally impossible.
+
+Test suite: 233 → 235.
+
 ## 0.3.0
 
 Verifier discipline, structured reviews, and a much richer surface — the

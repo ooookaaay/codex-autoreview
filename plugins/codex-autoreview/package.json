@@ -1,6 +1,6 @@
 {
   "name": "codex-autoreview",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "Standalone Claude Code plugin: automatic background Codex review of plans and code changes.",

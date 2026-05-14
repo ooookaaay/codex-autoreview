@@ -1,6 +1,6 @@
 {
   "name": "codex-autoreview-marketplace",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Single-plugin Claude Code marketplace for codex-autoreview — automatic background Codex review of plans and code changes.",
   "license": "Apache-2.0",

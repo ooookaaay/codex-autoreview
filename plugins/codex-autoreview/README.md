@@ -5,7 +5,7 @@
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A518.18-339933.svg)](package.json)
 [![tests](https://img.shields.io/badge/tests-node%3Atest-brightgreen.svg)](tests/)
-[![version](https://img.shields.io/badge/version-0.3.0-orange.svg)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.3.1-orange.svg)](CHANGELOG.md)
 
 A standalone [Claude Code](https://docs.claude.com/en/docs/claude-code) plugin
 that sends Claude's plans and code changes to the **Codex CLI** for background

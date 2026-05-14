@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "codex-autoreview",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Automatically sends Claude's plans and code changes to the Codex CLI for background verifier-style reviews — devil's-advocate plan critique and claim-based bug finding — surfaces the verdicts back into the session, tracks tokens and cost, and cleans up after itself.",
   "author": {
     "name": "codex-autoreview contributors"
