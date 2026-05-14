@@ -33,6 +33,8 @@ import {
   extractVerdictLine,
   getCodexAvailability,
   hasEffortOverride,
+  isSignalablePid,
+  killProcessTree,
   normalizeModel,
   normalizeReasoningEffort,
   normalizeTimeoutMs,
@@ -1809,4 +1811,72 @@ test("session-end hook kills only a VERIFIED review worker, never a reused pid",
   const reviews = loadState(repo).reviews;
   assert.equal(reviews.find((r) => r.id === realReviewId).status, "failed");
   assert.equal(reviews.find((r) => r.id === "fake-inflight").status, "failed");
+});
+
+test("isSignalablePid rejects the process-group-broadcast pids (0, 1, -1, NaN)", () => {
+  // SAFETY-CRITICAL. Every kill site signals `-pid` (the process GROUP).
+  // `process.kill(-1)` is a broadcast to every process the user owns — it would
+  // tear down every unrelated Claude Code session on the machine. `1` targets
+  // init. A bare `!pid` guard does NOT catch `1`/`-1` (`!1` and `!-1` are both
+  // `false`), so `isSignalablePid` is the floor: only a real child pid (> 1).
+  for (const bad of [0, 1, -1, -1234, NaN, 1.5, "1234", null, undefined]) {
+    assert.equal(
+      isSignalablePid(bad),
+      false,
+      `isSignalablePid(${String(bad)}) must be false — not a safe kill target`
+    );
+  }
+  // A real OS child pid (always an integer ≥ 2) is accepted.
+  for (const ok of [2, 1234, 99999]) {
+    assert.equal(isSignalablePid(ok), true, `isSignalablePid(${ok}) must be true`);
+  }
+});
+
+test("killProcessTree never broadcasts: pid 1 / -1 / 0 leave bystanders alive", async () => {
+  // Regression for the `if (!pid)` footgun: `!1 === false`, so an un-hardened
+  // guard would let `killProcessTree(1, …)` reach `process.kill(-1, …)` — a
+  // SIGKILL broadcast to every process the user owns. Spawn an innocent
+  // bystander and assert that calling killProcessTree with each pathological
+  // pid does NOT kill it (a real broadcast would).
+  const { spawn } = await import("node:child_process");
+  const bystander = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], {
+    stdio: "ignore"
+  });
+  // Give it a moment to actually be running.
+  await waitFor(
+    () => {
+      try {
+        process.kill(bystander.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { timeoutMs: 4000, intervalMs: 25 }
+  );
+
+  try {
+    for (const bad of [1, -1, 0, NaN, undefined]) {
+      killProcessTree(/** @type {any} */ (bad), "SIGKILL");
+    }
+    // The bystander — and this very test process — must still be alive. If
+    // killProcessTree had broadcast (process.kill(-1, "SIGKILL")) neither would
+    // be.
+    let bystanderAlive = true;
+    try {
+      process.kill(bystander.pid, 0);
+    } catch {
+      bystanderAlive = false;
+    }
+    assert.ok(
+      bystanderAlive,
+      "killProcessTree(1|-1|0, SIGKILL) must NOT broadcast — the bystander must survive"
+    );
+  } finally {
+    try {
+      bystander.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
 });

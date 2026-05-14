@@ -43,6 +43,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
 
+import { isSignalablePid } from "../codex.mjs";
 import {
   fromVerdictLine,
   normalizeReviewResult,
@@ -320,11 +321,16 @@ export function spawnWithTimeout(params) {
 
     /**
      * Kill the child's whole process group; fall back to the direct child.
+     *
+     * SAFETY: the pid is gated by {@link isSignalablePid} — a `0`/`1`/`-1`/
+     * non-integer pid would turn `process.kill(-pid)` into a process-group
+     * broadcast (`-1` → every process the user owns) or an init-targeting
+     * signal. Only a real child pid (integer > 1) is ever signalled.
      * @param {NodeJS.Signals} signal
      */
     const killTree = (signal) => {
       const pid = child.pid;
-      if (!pid) {
+      if (!isSignalablePid(pid)) {
         return;
       }
       try {

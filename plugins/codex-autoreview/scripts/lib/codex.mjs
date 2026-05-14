@@ -482,6 +482,32 @@ export function buildCodexExecArgs(params) {
 }
 
 /**
+ * Whether `pid` is a value it is SAFE to pass to `process.kill(-pid, …)` /
+ * `process.kill(pid, …)` as a real, specific process target.
+ *
+ * SAFETY-CRITICAL. `process.kill` overloads the sign of its argument: a
+ * NEGATIVE pid signals the whole PROCESS GROUP. The pathological inputs are not
+ * just `0`/`null`/`undefined` — they are `1` and `-1`:
+ *   - `process.kill(-1, signal)` is a BROADCAST to every process the caller's
+ *     user owns (POSIX `kill(-1)`), which would tear down every unrelated
+ *     Claude Code session on the machine;
+ *   - `process.kill(1, signal)` targets init/systemd.
+ * A bare `if (!pid)` guard does NOT catch these — `!1` and `!-1` are both
+ * `false`, so `1` and `-1` slip straight through. Every kill site in this
+ * plugin signals `-pid` (the group), so the floor must be a real child pid:
+ * an integer strictly greater than 1. `spawn().pid` is always either
+ * `undefined` (spawn failed) or an OS child pid ≥ 2, so this never rejects a
+ * legitimate target — it only refuses the catastrophic ones, including a
+ * `pid` that came from a corrupted/hand-edited `state.json`.
+ *
+ * @param {unknown} pid
+ * @returns {pid is number}
+ */
+export function isSignalablePid(pid) {
+  return typeof pid === "number" && Number.isInteger(pid) && pid > 1;
+}
+
+/**
  * Best-effort kill of a process and everything it spawned.
  *
  * The child is started with `detached: true`, so it leads its own process
@@ -493,11 +519,16 @@ export function buildCodexExecArgs(params) {
  * its own SIGTERM/SIGINT handler — otherwise killing the worker would orphan
  * the (expensive) codex run.
  *
+ * SAFETY: the pid is gated by {@link isSignalablePid} before EITHER signal —
+ * a `0`/`1`/`-1`/`NaN`/non-integer pid would otherwise turn `process.kill(-pid)`
+ * into a process-group broadcast (`-1` → every process the user owns) or an
+ * init-targeting signal. Only a real child pid (integer > 1) is ever signalled.
+ *
  * @param {number | undefined} pid
  * @param {NodeJS.Signals} signal
  */
 export function killProcessTree(pid, signal) {
-  if (!pid) {
+  if (!isSignalablePid(pid)) {
     return;
   }
   try {

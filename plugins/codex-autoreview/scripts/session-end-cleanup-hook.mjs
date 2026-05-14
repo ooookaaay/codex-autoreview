@@ -35,6 +35,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { SESSION_ID_ENV } from "./lib/auto-review.mjs";
+import { isSignalablePid } from "./lib/codex.mjs";
 import {
   listReviews,
   reconcileAndPruneReviews,
@@ -165,7 +166,13 @@ function killSessionWorkers(reviews, sessionId, options = {}) {
     if (!inFlight && !(includeTerminal && review.status === "failed")) {
       continue;
     }
-    const pid = typeof review.pid === "number" && review.pid > 0 ? review.pid : null;
+    // SAFETY: `review.pid` comes off disk (`state.json`) and is then used with
+    // `process.kill(-pid)` — a process-GROUP signal. A `0`/`1`/`-1`/non-integer
+    // pid (stale, corrupt, or hand-edited state) must never reach that call:
+    // `process.kill(-1)` is a broadcast to every process the user owns, which
+    // would kill every unrelated Claude Code session on the machine.
+    // `isSignalablePid` rejects everything that is not a real child pid (> 1).
+    const pid = isSignalablePid(review.pid) ? review.pid : null;
     if (!pid || killedPids.has(pid)) {
       continue;
     }
