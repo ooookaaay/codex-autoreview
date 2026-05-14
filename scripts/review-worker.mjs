@@ -256,11 +256,17 @@ async function main() {
   // Claim the review as `running` only if it has NOT been reconciled to a
   // terminal state in the meantime (compare-and-set). If the claim is rejected,
   // a cleanup already finished this review — abort without running codex.
+  //
+  // The worker records ITS OWN pid here, in the SAME compare-and-set that marks
+  // the review `running`. The dispatcher also patches the pid after spawn(),
+  // but there is a window between the worker claiming `running` and that parent
+  // patch landing; without this self-write, a SessionEnd hook firing in that
+  // window would see a running review with no pid and be unable to kill it.
   const claim = updateReviewIf(
     workspaceRoot,
     reviewId,
     (current) => !isTerminalStatus(current),
-    { status: "running" }
+    { status: "running", pid: process.pid }
   );
   if (!claim.applied) {
     appendLog(logFile, "Review was finalized before this worker could claim it; aborting.");

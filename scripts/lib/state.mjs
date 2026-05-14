@@ -24,10 +24,21 @@ const STATE_FILE_NAME = "state.json";
 const REVIEWS_DIR_NAME = "reviews";
 const MAX_REVIEWS = 20;
 const LOCK_FILE_NAME = "state.json.lock";
-/** Treat a lock older than this as stale (a crashed writer never released it). */
+/**
+ * Treat a lock older than this as stale (a crashed writer never released it).
+ * A legitimate critical section here is a small JSON read + atomic write —
+ * single-digit milliseconds — so a lock held longer than this many seconds
+ * means its owner died mid-write.
+ */
 const LOCK_STALE_MS = 15_000;
-/** How long to keep retrying to acquire the lock before giving up. */
-const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
+/**
+ * How long to keep retrying to acquire the lock before, as an absolute last
+ * resort, proceeding unlocked. Set generously (30s) relative to the millisecond
+ * critical section: in practice the lock is always acquired well within this,
+ * and a single dropped state update would be worse for this single-machine
+ * plugin than the vanishingly rare unlocked write this guards.
+ */
+const LOCK_ACQUIRE_TIMEOUT_MS = 30_000;
 /** Busy-wait granularity between lock acquisition attempts. */
 const LOCK_RETRY_MS = 25;
 
@@ -226,12 +237,29 @@ function withStateLock(cwd, fn) {
   ensureStateDir(cwd);
   const lockFile = resolveLockFile(cwd);
   const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  // A unique OWNERSHIP TOKEN for this acquisition. The lock file's content is
+  // `<pid>:<token>`; the holder only ever removes the lock if the file still
+  // carries its own token. This prevents the classic race where writer A
+  // stale-breaks writer B's lock, A acquires, then B's `finally` deletes A's
+  // lock — handing the "lock" to a third writer while A is still inside.
+  const token = `${process.pid}.${Date.now().toString(36)}.${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
   let acquired = false;
+
+  /** @returns {string | null} the lock file's current content, or null if gone. */
+  const readLock = () => {
+    try {
+      return fs.readFileSync(lockFile, "utf8").trim();
+    } catch {
+      return null;
+    }
+  };
 
   while (!acquired) {
     try {
       const fd = fs.openSync(lockFile, "wx");
-      fs.writeSync(fd, `${process.pid}\n`);
+      fs.writeSync(fd, `${process.pid}:${token}\n`);
       fs.closeSync(fd);
       acquired = true;
     } catch (error) {
@@ -240,11 +268,18 @@ function withStateLock(cwd, fn) {
         // rather than lose the update entirely.
         break;
       }
-      // Break a stale lock left behind by a crashed writer.
+      // Break a stale lock left behind by a crashed writer — but only if the
+      // SAME lock content is still there after the stale interval (otherwise
+      // the owner is alive and rotating, or already released).
       try {
+        const before = readLock();
         const age = Date.now() - fs.statSync(lockFile).mtimeMs;
         if (age > LOCK_STALE_MS) {
-          fs.rmSync(lockFile, { force: true });
+          // Re-read: only remove if the content is unchanged since `before`,
+          // i.e. we are breaking the exact stale lock we observed.
+          if (before !== null && readLock() === before) {
+            fs.rmSync(lockFile, { force: true });
+          }
           continue;
         }
       } catch {
@@ -252,7 +287,9 @@ function withStateLock(cwd, fn) {
         continue;
       }
       if (Date.now() >= deadline) {
-        // Give up waiting and proceed unlocked rather than drop the update.
+        // Absolute last resort: proceed unlocked rather than drop the update.
+        // With a 30s acquire window vs a millisecond critical section this is
+        // effectively unreachable in practice.
         break;
       }
       sleepSync(LOCK_RETRY_MS);
@@ -264,7 +301,12 @@ function withStateLock(cwd, fn) {
   } finally {
     if (acquired) {
       try {
-        fs.rmSync(lockFile, { force: true });
+        // Only remove the lock if it still carries OUR token — never delete a
+        // lock a different writer now owns (e.g. after our lock was itself
+        // stale-broken because we ran long).
+        if (readLock() === `${process.pid}:${token}`) {
+          fs.rmSync(lockFile, { force: true });
+        }
       } catch {
         // Best-effort release; a leftover lock will be broken as stale.
       }

@@ -731,6 +731,30 @@ test("pruneReviews never drops a non-terminal review, even past MAX_REVIEWS", ()
   assert.ok(keptTerminal.length < 30, "terminal reviews ARE subject to the ring-buffer cap");
 });
 
+test("updateState leaves no lock file behind and tolerates a foreign stale lock", () => {
+  const { repo } = setupRepo();
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const lockFile = path.join(stateDir, "state.json.lock");
+
+  // A normal update must release its own lock cleanly.
+  upsertReview(repo, { id: "lock-1", kind: "code", status: "queued" });
+  assert.equal(fs.existsSync(lockFile), false, "updateState must not leave its lock file behind");
+
+  // A FOREIGN, already-stale lock file (content from some other writer, mtime
+  // far in the past) must be broken so a new update still goes through — and
+  // the new update must then clean up after itself.
+  fs.writeFileSync(lockFile, "999999:foreign.token\n", "utf8");
+  const oldTime = new Date(Date.now() - 60_000);
+  fs.utimesSync(lockFile, oldTime, oldTime);
+  upsertReview(repo, { id: "lock-2", kind: "code", status: "queued" });
+  assert.ok(
+    loadState(repo).reviews.find((r) => r.id === "lock-2"),
+    "an update must still succeed past a foreign stale lock"
+  );
+  assert.equal(fs.existsSync(lockFile), false, "the update must clean up the lock it acquired");
+});
+
 test("saveState writes atomically — readers never see partial JSON", () => {
   const { repo } = setupRepo();
   // Drive a batch of updates, re-parsing the state file after every one. An
@@ -869,6 +893,42 @@ test("review-worker marks a hung review failed (timeout) — never left running"
   const review = loadState(repo).reviews.find((r) => r.id === reviewId);
   assert.equal(review.status, "failed", "a hung review must land in 'failed', not 'running'");
   assert.match(review.errorMessage, /timed out after \d+s/);
+});
+
+test("review-worker records its OWN pid in the same CAS that claims 'running'", async () => {
+  const binDir = makeTempDir();
+  installHangingCodex(binDir); // keeps the worker alive in `running`
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const reviewId = seedQueuedReview(repo, { timeoutMs: 120_000 });
+
+  const { spawn } = await import("node:child_process");
+  const worker = spawn("node", [WORKER, "--cwd", repo, "--review-id", reviewId], {
+    env: buildEnv(binDir),
+    stdio: "ignore"
+  });
+
+  // As soon as the worker has claimed `running`, the review MUST already carry
+  // a pid — written by the worker itself in the same compare-and-set, not left
+  // to the dispatcher's later patch. This closes the window where SessionEnd
+  // would see a running review with no pid and be unable to kill it.
+  await waitFor(
+    () => loadState(repo).reviews.find((r) => r.id === reviewId)?.status === "running",
+    { timeoutMs: 8000, intervalMs: 50 }
+  );
+  const review = loadState(repo).reviews.find((r) => r.id === reviewId);
+  assert.equal(review.status, "running");
+  assert.equal(
+    review.pid,
+    worker.pid,
+    "the running review must carry the worker's own pid immediately"
+  );
+
+  worker.kill("SIGKILL");
+  await waitFor(() => worker.exitCode !== null || worker.signalCode !== null, {
+    timeoutMs: 8000,
+    intervalMs: 100
+  });
 });
 
 test("review-worker never resurrects a review already finalized by cleanup", () => {
