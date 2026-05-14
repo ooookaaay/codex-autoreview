@@ -14,6 +14,13 @@
  *      count — always keeping the most recent few so `/codex-autoreview:last`
  *      still works after a clear.
  *   3. Removes this session's own stale per-review log/output files.
+ *   4. Emits an end-of-session DIGEST (Phase 2C): a one-shot summary of this
+ *      session's review activity — how many reviews ran, the findings by
+ *      severity, total tokens, and the estimated USD spend. It is a pure
+ *      read-over-state report written AFTER the cleanup log; it does not touch
+ *      state and cannot regress the cleanup logic above it. SessionEnd has no
+ *      `additionalContext` channel (claude-code-platform.md §1.3), so the
+ *      digest is logged to stderr like the cleanup line.
  *
  * SAFETY: this hook only ever touches the plugin's own per-project state
  * directory. It never reads, writes, or deletes anything under `~/.codex` —
@@ -217,6 +224,153 @@ function removePrunedReviewFiles(workspaceRoot, prunedReviewIds) {
   return removed;
 }
 
+/**
+ * Whether a review belongs to `sessionId` — it carries a `request.sessionId`
+ * matching it. A review with no session attribution is NOT counted for any
+ * specific session's digest (it cannot be confidently tied to this session).
+ *
+ * @param {import("./lib/state.mjs").ReviewRecord} review
+ * @param {string | null} sessionId
+ * @returns {boolean}
+ */
+function belongsToSession(review, sessionId) {
+  if (!sessionId) {
+    return false;
+  }
+  const request = review.request;
+  return Boolean(
+    request && typeof request === "object" && request.sessionId === sessionId
+  );
+}
+
+/**
+ * @param {number} value
+ * @returns {string} `value` with thousands separators (e.g. `12,345`).
+ */
+function formatCount(value) {
+  return Number.isFinite(value) ? Math.trunc(value).toLocaleString("en-US") : "0";
+}
+
+/**
+ * Build the end-of-session digest line for this session's review activity.
+ *
+ * PURE READ over the post-cleanup review list — it never mutates state, so it
+ * cannot regress the verified cleanup logic. Counts every review attributed to
+ * this session (including the ones cleanup just reconciled to `failed`):
+ *   - N reviews, broken down by terminal status;
+ *   - M findings, broken down by severity (from each review's structured
+ *     `result.findings[]`, when present);
+ *   - total tokens in/out and estimated USD, summed from each review's
+ *     `result.usage` block.
+ *
+ * Returns `null` when this session ran no reviews — nothing to report.
+ *
+ * @param {import("./lib/state.mjs").ReviewRecord[]} reviews - State AFTER cleanup.
+ * @param {string | null} sessionId
+ * @returns {string | null}
+ */
+function buildSessionDigest(reviews, sessionId) {
+  const mine = reviews.filter((review) => belongsToSession(review, sessionId));
+  if (mine.length === 0) {
+    return null;
+  }
+
+  let completed = 0;
+  let failed = 0;
+  let other = 0;
+  let high = 0;
+  let medium = 0;
+  let low = 0;
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let costUsd = 0;
+  let costKnown = false;
+  let costPartial = false;
+
+  for (const review of mine) {
+    if (review.status === "completed") {
+      completed += 1;
+    } else if (review.status === "failed") {
+      failed += 1;
+    } else {
+      other += 1;
+    }
+
+    const result = review.result && typeof review.result === "object" ? review.result : null;
+    const findings = Array.isArray(result && result.findings) ? result.findings : [];
+    for (const finding of findings) {
+      if (!finding) {
+        continue;
+      }
+      if (finding.severity === "high") {
+        high += 1;
+      } else if (finding.severity === "medium") {
+        medium += 1;
+      } else if (finding.severity === "low") {
+        low += 1;
+      }
+    }
+
+    const usage = result && result.usage && typeof result.usage === "object" ? result.usage : null;
+    if (usage) {
+      if (typeof usage.tokensIn === "number" && Number.isFinite(usage.tokensIn)) {
+        tokensIn += Math.max(0, usage.tokensIn);
+      }
+      if (typeof usage.tokensOut === "number" && Number.isFinite(usage.tokensOut)) {
+        tokensOut += Math.max(0, usage.tokensOut);
+      }
+      if (typeof usage.costUsd === "number" && Number.isFinite(usage.costUsd)) {
+        costUsd += usage.costUsd;
+        costKnown = true;
+      } else {
+        // A usage block with no priced cost — the total is at best partial.
+        costPartial = true;
+      }
+    }
+  }
+
+  const totalFindings = high + medium + low;
+  const parts = [];
+  parts.push(`${mine.length} review(s)`);
+  const statusBits = [];
+  if (completed > 0) {
+    statusBits.push(`${completed} completed`);
+  }
+  if (failed > 0) {
+    statusBits.push(`${failed} failed`);
+  }
+  if (other > 0) {
+    statusBits.push(`${other} in-flight`);
+  }
+  if (statusBits.length > 0) {
+    parts.push(`(${statusBits.join(", ")})`);
+  }
+  parts.push(
+    `${totalFindings} finding(s) [${high} high, ${medium} medium, ${low} low]`
+  );
+
+  let tokenPart;
+  if (tokensIn === 0 && tokensOut === 0) {
+    tokenPart = "tokens: n/a";
+  } else {
+    tokenPart = `tokens: ${formatCount(tokensIn)} in / ${formatCount(tokensOut)} out`;
+  }
+  parts.push(tokenPart);
+
+  let costPart;
+  if (!costKnown) {
+    costPart = "est. cost: unknown";
+  } else {
+    // Sub-dollar review costs need the extra precision (a typical review is a
+    // few cents); only round to 2 decimals once the total is at least $1.
+    const rendered = costUsd < 1 ? costUsd.toFixed(4) : costUsd.toFixed(2);
+    costPart = `est. cost: ~$${rendered}${costPartial ? "+ (partial — some reviews unpriced)" : ""}`;
+  }
+  parts.push(costPart);
+
+  return `codex-autoreview: session digest — ${parts.join(" · ")}.`;
+}
+
 function main() {
   const input = readHookInput();
   const cwd =
@@ -267,6 +421,21 @@ function main() {
       `reconciled ${reconciled} in-flight review(s), healed ${healed} stuck review(s), ` +
       `pruned ${pruned} old record(s) (kept ${kept}), removed ${filesRemoved} stale file(s).`
   );
+
+  // 5. End-of-session DIGEST. A pure read over the post-cleanup review list
+  //    (`reviewsAfter` already reflects the reconcile above; record pruning
+  //    happened inside reconcileAndPruneReviews). It never mutates state, so it
+  //    runs strictly after — and cannot regress — the cleanup logic. A failure
+  //    here is swallowed so the digest can never disrupt session shutdown.
+  try {
+    const digest = buildSessionDigest(reviewsAfter, sessionId);
+    if (digest) {
+      logNote(digest);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`codex-autoreview: session digest skipped: ${message}\n`);
+  }
 }
 
 try {
